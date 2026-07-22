@@ -40,8 +40,10 @@ class GameSession:
         self.created_at: float = time.time()
         self.last_active: float = time.time()
 
-        # Ring buffer: stores frame dicts, maxlen drops oldest frames
-        self.frame_buffer: deque = deque(maxlen=BUFFER_FRAMES)
+        # Frame buffer: stores ALL frames from game start (no size limit).
+        # Previously ring-buffered to last 30s, but that dropped early frames
+        # that new observers need to reconstruct the full game state.
+        self.frame_buffer: deque = deque()
 
         # Connections
         self.streamer_ws: Optional[WebSocket] = None
@@ -159,11 +161,16 @@ async def list_games():
     result = []
     for g in games.values():
         if g.is_active:
+            # Show frame range to debug buffer contents
+            frame_nums = [f.get("frame", 0) for f in g.frame_buffer] if g.frame_buffer else []
             result.append({
                 "game_id": g.game_id,
                 "map": g.map_name,
                 "players": g.players,
                 "viewers": len(g.observer_ws_set),
+                "buffer_frames": len(g.frame_buffer),
+                "frame_range": f"{min(frame_nums)}-{max(frame_nums)}" if frame_nums else "empty",
+                "current_frame": g.current_frame,
             })
     return result
 
@@ -186,6 +193,7 @@ async def register_endpoint(websocket: WebSocket):
     try:
         # ── Step 1: wait for register message ────────────────────────────
         raw = await websocket.receive_text()
+        print(f"[REGISTER_RAW] received {len(raw)} bytes: {repr(raw[:300])}")
         reg = json.loads(raw)
         if reg.get("type") != "register":
             await websocket.send_json({"type": "error", "message": "First message must be type=register"})
@@ -283,6 +291,7 @@ async def _streamer_loop(ws: WebSocket, session: GameSession) -> None:
                 "version": msg.get("version", ""),
                 "exe_crc": msg.get("exe_crc", ""),
                 "ini_crc": msg.get("ini_crc", ""),
+                "game_options": msg.get("game_options", ""),
             }
             metadata_received = True
             await session.broadcast_meta()
@@ -345,19 +354,12 @@ async def watch_game(websocket: WebSocket, game_id: str):
 
         # ── Send buffered frames (catch-up) ──────────────────────────────
         if session.frame_buffer:
-            # Send a catch-up indicator
+            # Send ALL catch-up frames in ONE bulk message
+            # Must convert deque to list — send_json cannot serialize deque
             await websocket.send_json({
-                "type": "catchup_start",
+                "type": "catchup_bulk",
+                "frames": list(session.frame_buffer),
                 "frame_count": len(session.frame_buffer),
-                "last_frame": session.current_frame,
-            })
-            for frame_data in session.frame_buffer:
-                try:
-                    await websocket.send_json(frame_data)
-                except Exception:
-                    break
-            await websocket.send_json({
-                "type": "catchup_end",
                 "last_frame": session.current_frame,
             })
         else:
@@ -438,17 +440,20 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
             "server_frame": session.current_frame,
         })
 
-        # Send frames from last_frame+1
-        sent = 0
-        for frame_data in session.frame_buffer:
-            if frame_data.get("frame", 0) > last_frame:
-                try:
-                    await websocket.send_json(frame_data)
-                    sent += 1
-                except Exception:
-                    break
+        # Send frames from last_frame+1 as a single bulk message
+        filtered_frames = [
+            f for f in session.frame_buffer
+            if f.get("frame", 0) > last_frame
+        ]
+        if filtered_frames:
+            await websocket.send_json({
+                "type": "catchup_bulk",
+                "frames": filtered_frames,
+                "frame_count": len(filtered_frames),
+                "last_frame": session.current_frame,
+            })
 
-        print(f"[RECONNECT] Sent {sent} frames to observer (from frame {last_frame+1})")
+        print(f"[RECONNECT] Sent {len(filtered_frames)} frames to observer (from frame {last_frame+1})")
 
         # Now keep alive for real-time frames
         while True:
