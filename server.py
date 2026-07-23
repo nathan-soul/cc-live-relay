@@ -66,6 +66,12 @@ class GameSession:
             self.frame_buffer.append(frame_data)
             self.last_active = time.time()
 
+            # Debug: log frame command sizes periodically
+            fn = frame_data.get("frame", 0)
+            cmd = frame_data.get("commands", "")
+            if fn % 500 == 0 or len(cmd) > 0:
+                print(f"[FRAME] game={self.game_hash[:8]} frame={fn} cmd_bytes={len(cmd)} fps={frame_data.get('fps', '?')}")
+
         # Broadcast outside lock to avoid holding it during sends
         await self._broadcast_to_observers(frame_data)
 
@@ -153,6 +159,65 @@ async def health():
         "status": "ok",
         "active_games": sum(1 for g in games.values() if g.is_active),
         "total_observers": total_observers,
+    }
+
+
+@app.get("/debug/frames/{game_id}")
+async def debug_frames(
+    game_id: str,
+    offset: int = 0,
+    limit: int = 0,
+    showallframes: bool = False,
+):
+    """Return frames with their data for debugging.
+
+    Parameters:
+        game_id:        Game hash
+        offset:         Skip first N frames (default 0)
+        limit:          Max frames to return (0 = ALL, default 0)
+        showallframes:  Show ALL frames including empty ones (default: only frames with data)
+
+    Each frame includes:
+        frame:     Frame number
+        fps:       Streamer FPS at time of frame
+        cmd_bytes: Length of base64-encoded command buffer
+        commands:  First 200 chars of the base64 command payload
+    """
+    session = games.get(game_id.upper())
+    if not session:
+        return {"error": "game not found"}
+
+    frames = list(session.frame_buffer)
+
+    # Filter out empty frames unless showallframes is set
+    if not showallframes:
+        frames = [f for f in frames if f.get("commands", "") or f.get("cmd_bytes", 0) > 0]
+
+    total = len(frames)
+
+    sliced = frames[offset:]
+    if limit and limit > 0:
+        sliced = sliced[:limit]
+
+    result = []
+    for f in sliced:
+        fn = f.get("frame", 0)
+        fps = f.get("fps", 0)
+        cmd = f.get("commands", "")
+        result.append({
+            "frame": fn,
+            "fps": fps,
+            "cmd_bytes": len(cmd),
+            "commands": cmd[:200],  # first 200 chars of base64 payload
+        })
+
+    return {
+        "game_id": session.game_id,
+        "total_frames": total,
+        "returned": len(result),
+        "offset": offset,
+        "limit": limit if limit else 0,
+        "frames": result,
     }
 
 
