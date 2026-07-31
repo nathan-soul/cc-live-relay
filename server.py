@@ -76,6 +76,7 @@ class GameSession:
         self.observer_ws_set: set[WebSocket] = set()
 
         self._lock = asyncio.Lock()
+        self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
 
     # ── Data ingestion (called from source loop) ─────────────────────────
 
@@ -192,12 +193,14 @@ class GameSession:
             if len(self.observer_ws_set) >= MAX_OBSERVERS_PER_GAME:
                 return False
             self.observer_ws_set.add(ws)
+            self._observer_send_locks[ws] = asyncio.Lock()
             self.last_active = time.time()
             return True
 
     async def remove_observer(self, ws: WebSocket) -> None:
         async with self._lock:
             self.observer_ws_set.discard(ws)
+            self._observer_send_locks.pop(ws, None)
 
     async def send_catchup(self, ws: WebSocket, last_offset: int = 0) -> None:
         """Send header + body[last_offset:] in chunks to a single observer."""
@@ -205,20 +208,26 @@ class GameSession:
             header_snapshot = bytes(self.header)
             body_snapshot = bytes(self.body)
             ended_snapshot = self.ended
+            send_lock = self._observer_send_locks.get(ws)
 
-        if header_snapshot:
-            await ws.send_bytes(pack_frame(MSG_HEADER, header_snapshot))
+        if send_lock is None:
+            return
 
-        last_offset = min(last_offset, len(body_snapshot))
-        body_slice = body_snapshot[last_offset:]
-        header_size = len(header_snapshot)
-        for chunk_off in range(0, len(body_slice), CHUNK_SIZE):
-            chunk = body_slice[chunk_off:chunk_off + CHUNK_SIZE]
-            chunk_payload = struct.pack('<Q', header_size + last_offset + chunk_off) + chunk
-            await ws.send_bytes(pack_frame(MSG_BODY, chunk_payload))
+        # Serialise sends to this observer against concurrent _broadcast_envelope.
+        async with send_lock:
+            if header_snapshot:
+                await ws.send_bytes(pack_frame(MSG_HEADER, header_snapshot))
 
-        if ended_snapshot:
-            await ws.send_bytes(pack_frame(MSG_END, b''))
+            last_offset = min(last_offset, len(body_snapshot))
+            body_slice = body_snapshot[last_offset:]
+            header_size = len(header_snapshot)
+            for chunk_off in range(0, len(body_slice), CHUNK_SIZE):
+                chunk = body_slice[chunk_off:chunk_off + CHUNK_SIZE]
+                chunk_payload = struct.pack('<Q', header_size + last_offset + chunk_off) + chunk
+                await ws.send_bytes(pack_frame(MSG_BODY, chunk_payload))
+
+            if ended_snapshot:
+                await ws.send_bytes(pack_frame(MSG_END, b''))
 
     # ── Broadcast ────────────────────────────────────────────────────────
 
@@ -227,12 +236,19 @@ class GameSession:
         frame = pack_frame(msg_type, payload)
         dead: list[WebSocket] = []
         for ws in list(self.observer_ws_set):
+            lock = self._observer_send_locks.get(ws)
+            if lock is None:
+                continue
             try:
-                await ws.send_bytes(frame)
-            except Exception:
+                async with lock:
+                    await ws.send_bytes(frame)
+            except Exception as e:
+                print(f"[WARN] send to observer failed ({type(e).__name__}: {e}), marking dead")
                 dead.append(ws)
         for ws in dead:
-            self.observer_ws_set.discard(ws)
+            async with self._lock:
+                self.observer_ws_set.discard(ws)
+                self._observer_send_locks.pop(ws, None)
 
 
 # ── In-memory state ────────────────────────────────────────────────────────
