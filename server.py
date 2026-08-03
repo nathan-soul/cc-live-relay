@@ -85,6 +85,7 @@ class GameSession:
 
         self._lock = asyncio.Lock()
         self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
+        self._observer_catchup_limit: dict[WebSocket, int] = {}
 
     # ── Data ingestion (called from source loop) ─────────────────────────
 
@@ -132,6 +133,7 @@ class GameSession:
         data = payload[8:]
 
         should_broadcast = False
+        targets: list = []
         async with self._lock:
             body_len = len(self.body)
 
@@ -139,6 +141,11 @@ class GameSession:
                 self.body.extend(data)
                 self.last_active = time.time()
                 should_broadcast = True
+                # Fix the recipient list here, while still holding the lock that guards the
+                # append. An observer registering after this point records a catch-up limit
+                # that already covers these bytes, so sending them the live chunk as well
+                # would duplicate it.
+                targets = list(self.observer_ws_set)
                 if len(self.body) < 5000 or len(self.body) % 50000 == 0:
                     print(f"[LIVESTREAMER] [BODY] Game {self.game_hash[:12]}: +{len(data)}B @ offset={offset} total={len(self.body)}")
             elif offset < body_len:
@@ -154,7 +161,7 @@ class GameSession:
         if should_broadcast:
             file_offset = len(self.header) + offset
             framed = struct.pack('<Q', file_offset) + data
-            await self._broadcast_envelope(MSG_BODY, framed)
+            await self._broadcast_envelope(MSG_BODY, framed, targets=targets)
 
     def save_replay(self) -> None:
         """Write header + body to a .rep file when the game ends."""
@@ -196,67 +203,109 @@ class GameSession:
 
     # ── Observer lifecycle ───────────────────────────────────────────────
 
-    async def add_observer(self, ws: WebSocket) -> bool:
+    async def add_observer(self, ws: WebSocket) -> Optional[asyncio.Lock]:
+        """Register an observer, returning its send lock *already held*.
+
+        The lock is taken before the socket joins observer_ws_set — that is, before it
+        becomes a target for _broadcast_envelope. Otherwise a live BODY chunk could be
+        delivered ahead of the catch-up chunks that precede it, and since observers write
+        each chunk at its absolute file offset, that leaves a hole in the observer's file.
+        The old client tolerated it by accident (its playhead ran far behind the tail);
+        the parse cursor added for the broadcast delay would stall on it instead.
+
+        The caller MUST release the lock once catch-up has been sent, including on error —
+        _broadcast_envelope waits on these locks sequentially, so one held forever would
+        block delivery to every observer of this game.
+        """
         async with self._lock:
             if len(self.observer_ws_set) >= MAX_OBSERVERS_PER_GAME:
-                return False
+                return None
+            send_lock = asyncio.Lock()
+            await send_lock.acquire()   # uncontended: nothing else can see it yet
+            self._observer_send_locks[ws] = send_lock
+            # Body length at the instant this observer became a broadcast target. Catch-up
+            # sends up to exactly here and live broadcasts carry on from it, so every byte
+            # is delivered exactly once — no hole, and no overlapping resend either.
+            self._observer_catchup_limit[ws] = len(self.body)
             self.observer_ws_set.add(ws)
-            self._observer_send_locks[ws] = asyncio.Lock()
             self.last_active = time.time()
-            return True
+            return send_lock
 
     async def remove_observer(self, ws: WebSocket) -> None:
         async with self._lock:
             self.observer_ws_set.discard(ws)
             self._observer_send_locks.pop(ws, None)
+            self._observer_catchup_limit.pop(ws, None)
 
-    async def send_catchup(self, ws: WebSocket, last_offset: int = 0) -> None:
-        """Send header + body[last_offset:] in chunks to a single observer."""
-        async with self._lock:
-            header_snapshot = bytes(self.header)
-            body_snapshot = bytes(self.body)
-            ended_snapshot = self.ended
-            delay_snapshot = self.delay_seconds
-            send_lock = self._observer_send_locks.get(ws)
+    async def send_catchup(self, ws: WebSocket, last_offset: int = 0,
+                           held_lock: Optional[asyncio.Lock] = None) -> None:
+        """Send config + header + body[last_offset:] in chunks to a single observer.
 
-        if send_lock is None:
+        Pass held_lock when the caller already holds this observer's send lock (the normal
+        path — see add_observer). Otherwise the lock is acquired here.
+        """
+        if held_lock is not None:
+            await self._send_catchup_locked(ws, last_offset)
             return
 
-        # Serialise sends to this observer against concurrent _broadcast_envelope.
+        async with self._lock:
+            send_lock = self._observer_send_locks.get(ws)
+        if send_lock is None:
+            return
         async with send_lock:
-            # Must precede the HEADER: receiving the header is what starts playback on the
-            # observer, and the pre-roll buffer latches against the delay — a value that
-            # arrived afterwards would be too late to take effect for this session.
-            config_json = json.dumps({"role": "observer", "game_id": self.game_id,
-                "delay_seconds": delay_snapshot}, separators=(',', ':'))
-            await ws.send_bytes(pack_frame(MSG_ROLE, config_json.encode()))
+            await self._send_catchup_locked(ws, last_offset)
 
-            if header_snapshot:
-                await ws.send_bytes(pack_frame(MSG_HEADER, header_snapshot))
+    async def _send_catchup_locked(self, ws: WebSocket, last_offset: int) -> None:
+        """send_catchup body. Caller must hold this observer's send lock."""
+        async with self._lock:
+            header_snapshot = bytes(self.header)
+            ended_snapshot = self.ended
+            delay_snapshot = self.delay_seconds
+            # Stop exactly where live broadcasts to this observer begin. Snapshotting the
+            # whole body instead would resend anything appended between registration and
+            # now — data the observer is also about to receive as a live chunk.
+            limit = self._observer_catchup_limit.get(ws, len(self.body))
+            body_snapshot = bytes(self.body[:limit])
 
-            last_offset = min(last_offset, len(body_snapshot))
-            body_slice = body_snapshot[last_offset:]
-            header_size = len(header_snapshot)
-            for chunk_off in range(0, len(body_slice), CHUNK_SIZE):
-                chunk = body_slice[chunk_off:chunk_off + CHUNK_SIZE]
-                chunk_payload = struct.pack('<Q', header_size + last_offset + chunk_off) + chunk
-                await ws.send_bytes(pack_frame(MSG_BODY, chunk_payload))
+        # Must precede the HEADER: receiving the header is what starts playback on the
+        # observer, and the pre-roll buffer latches against the delay — a value that
+        # arrived afterwards would be too late to take effect for this session.
+        config_json = json.dumps({"role": "observer", "game_id": self.game_id,
+            "delay_seconds": delay_snapshot}, separators=(',', ':'))
+        await ws.send_bytes(pack_frame(MSG_ROLE, config_json.encode()))
 
-            if ended_snapshot:
-                await ws.send_bytes(pack_frame(MSG_END, b''))
+        if header_snapshot:
+            await ws.send_bytes(pack_frame(MSG_HEADER, header_snapshot))
+
+        last_offset = min(last_offset, len(body_snapshot))
+        body_slice = body_snapshot[last_offset:]
+        header_size = len(header_snapshot)
+        for chunk_off in range(0, len(body_slice), CHUNK_SIZE):
+            chunk = body_slice[chunk_off:chunk_off + CHUNK_SIZE]
+            chunk_payload = struct.pack('<Q', header_size + last_offset + chunk_off) + chunk
+            await ws.send_bytes(pack_frame(MSG_BODY, chunk_payload))
+
+        if ended_snapshot:
+            await ws.send_bytes(pack_frame(MSG_END, b''))
 
         print(f"[OBSERVER] [CATCHUP] Sent header ({len(header_snapshot)}B) + body ({len(body_snapshot)}B, offset={last_offset}) to observer")
 
     # ── Broadcast ────────────────────────────────────────────────────────
 
-    async def _broadcast_envelope(self, msg_type: int, payload: bytes) -> None:
-        """Send binary frame to every connected observer. Removes dead connections."""
+    async def _broadcast_envelope(self, msg_type: int, payload: bytes,
+                                  targets: Optional[list] = None) -> None:
+        """Send binary frame to observers. Removes dead connections.
+
+        Pass targets to pin the recipient list to a moment in the past — for body data that
+        must be the instant the bytes were appended, so an observer that joined afterwards
+        (and will receive them via catch-up) is not also sent them live.
+        """
         frame = pack_frame(msg_type, payload)
         dead: list[WebSocket] = []
-        for ws in list(self.observer_ws_set):
+        for ws in (targets if targets is not None else list(self.observer_ws_set)):
             lock = self._observer_send_locks.get(ws)
             if lock is None:
-                continue
+                continue    # already removed, or never fully registered
             try:
                 async with lock:
                     await ws.send_bytes(frame)
@@ -267,6 +316,7 @@ class GameSession:
             async with self._lock:
                 self.observer_ws_set.discard(ws)
                 self._observer_send_locks.pop(ws, None)
+                self._observer_catchup_limit.pop(ws, None)
 
 
 # ── In-memory state ────────────────────────────────────────────────────────
@@ -316,6 +366,8 @@ async def debug_body(
 
 @app.get("/games")
 async def list_games():
+    """Live games available to watch. Backs the in-game observer browser."""
+    now = time.time()
     result = []
     for g in games.values():
         if not g.ended:
@@ -326,6 +378,12 @@ async def list_games():
                 "viewers": len(g.observer_ws_set),
                 "body_bytes": len(g.body),
                 "sources": len(g.sources),
+                # The observer applies this delay, so showing it up front sets the
+                # expectation of how far behind live the view will be.
+                "delay_seconds": g.delay_seconds,
+                # How long this game has been streaming. Joining a long-running game
+                # means starting well behind live, which is worth seeing before you commit.
+                "age_seconds": int(now - g.created_at),
             })
     return result
 
@@ -392,6 +450,16 @@ async def register_endpoint(websocket: WebSocket):
         else:
             session = GameSession(game_hash)
             games[game_hash] = session
+
+        # Descriptive metadata for GET /games. REGISTER has always carried these; they
+        # were simply never stored, so the game list rendered blank Map and Players
+        # columns. Take them from any client, streamer or not — an observer-only client
+        # still knows the map, and whoever registers first populates it.
+        map_name = reg.get("map_name", "")
+        if map_name and not session.map_name:
+            session.map_name = map_name
+        if player_name and player_name not in session.players:
+            session.players.append(player_name)
 
         if can_stream:
             role = "streamer"
@@ -494,8 +562,8 @@ async def watch_game(websocket: WebSocket, game_id: str):
         await websocket.close()
         return
 
-    added = await session.add_observer(websocket)
-    if not added:
+    send_lock = await session.add_observer(websocket)
+    if send_lock is None:
         await websocket.send_bytes(pack_frame(MSG_ERROR, b"Max observers reached"))
         await websocket.close()
         return
@@ -503,7 +571,12 @@ async def watch_game(websocket: WebSocket, game_id: str):
     print(f"[OBSERVER] [WATCH] Observer connected to game {game_id[:12]}... ({len(session.observer_ws_set)} viewers)")
 
     try:
-        await session.send_catchup(websocket, last_offset=0)
+        # add_observer handed us the send lock already held, so live broadcasts queue
+        # behind catch-up instead of racing ahead of it. Release it no matter what.
+        try:
+            await session.send_catchup(websocket, last_offset=0, held_lock=send_lock)
+        finally:
+            send_lock.release()
 
         while True:
             msg = await websocket.receive()
@@ -549,19 +622,22 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
 
         last_offset = msg.get("last_offset", 0)
 
-        added = await session.add_observer(websocket)
-        if not added:
+        send_lock = await session.add_observer(websocket)
+        if send_lock is None:
             await websocket.send_bytes(pack_frame(MSG_ERROR, b"Max observers reached"))
             await websocket.close()
             return
 
-        await websocket.send_json({
-            "type": "reconnect",
-            "last_offset": last_offset,
-            "server_body_bytes": len(session.body),
-        })
+        try:
+            await websocket.send_json({
+                "type": "reconnect",
+                "last_offset": last_offset,
+                "server_body_bytes": len(session.body),
+            })
 
-        await session.send_catchup(websocket, last_offset=last_offset)
+            await session.send_catchup(websocket, last_offset=last_offset, held_lock=send_lock)
+        finally:
+            send_lock.release()
         print(f"[OBSERVER] [RECONNECT] Sent body from offset {last_offset} (total body: {len(session.body)} bytes)")
 
         while True:
