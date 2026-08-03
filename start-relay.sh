@@ -82,6 +82,9 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 
+# Create the venv if missing, or recreate it when pip is unusable.
+# Some distros (Debian/Ubuntu) build a venv without pip when python3-venv
+# / ensurepip is not installed, so verify pip and not just bin/python.
 if [ ! -x "$VENV_DIR/bin/python" ]; then
     echo "Creating virtual environment at .venv ..."
     if ! "$PYTHON" -m venv "$VENV_DIR"; then
@@ -91,8 +94,20 @@ if [ ! -x "$VENV_DIR/bin/python" ]; then
     fi
 fi
 
+if ! "$VENV_DIR/bin/python" -m pip --version >/dev/null 2>&1; then
+    echo "pip is missing in the virtual environment; recreating .venv ..."
+    rm -rf "$VENV_DIR"
+    if ! "$PYTHON" -m venv "$VENV_DIR" \
+       || ! "$VENV_DIR/bin/python" -m pip --version >/dev/null 2>&1; then
+        echo "The virtual environment has no pip (ensurepip is unavailable)."
+        echo "Install python3-venv (e.g. sudo apt install python3-venv),"
+        echo "delete the .venv directory, and retry."
+        exit 1
+    fi
+fi
+
 echo "Checking dependencies..."
-if ! "$VENV_DIR/bin/pip" install -q -r "$RELAY_DIR/requirements.txt"; then
+if ! "$VENV_DIR/bin/python" -m pip install -q -r "$RELAY_DIR/requirements.txt"; then
     echo "pip install failed."
     exit 1
 fi
