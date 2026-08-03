@@ -1,10 +1,11 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+set -eu
 
 PORT="${1:-8765}"
 LISTEN_HOST="${2:-0.0.0.0}"
 
-RELAY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELAY_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
+VENV_DIR="$RELAY_DIR/.venv"
 
 # --- Firewall helpers ---------------------------------------------------------
 # Open TCP ${PORT} so players can reach the relay, and close it again when the
@@ -73,17 +74,30 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# --- Python / virtual environment ---------------------------------------------
+
 PYTHON="$(command -v python3 || command -v python || true)"
 if [ -z "$PYTHON" ]; then
     echo "Python not found. Install Python 3.8+."
     exit 1
 fi
 
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+    echo "Creating virtual environment at .venv ..."
+    if ! "$PYTHON" -m venv "$VENV_DIR"; then
+        echo "Could not create a virtual environment."
+        echo "Install the venv module (e.g. sudo apt install python3-venv) and retry."
+        exit 1
+    fi
+fi
+
 echo "Checking dependencies..."
-if ! "$PYTHON" -m pip install -q -r "$RELAY_DIR/requirements.txt"; then
+if ! "$VENV_DIR/bin/pip" install -q -r "$RELAY_DIR/requirements.txt"; then
     echo "pip install failed."
     exit 1
 fi
+
+# --- Firewall port -------------------------------------------------------------
 
 if [ -z "$FW_TOOL" ]; then
     echo "No firewall tool found (firewalld/ufw/iptables). Skipping port opening."
@@ -99,12 +113,14 @@ else
     fi
 fi
 
+# --- Run the relay -------------------------------------------------------------
+
 cd "$RELAY_DIR"
 export HOST="$LISTEN_HOST"
 export PORT="$PORT"
 
 echo "Starting relay on $LISTEN_HOST:$PORT ..."
-"$PYTHON" server.py &
+"$VENV_DIR/bin/python" server.py &
 PY_PID=$!
 
 trap 'kill "$PY_PID" 2>/dev/null' INT TERM

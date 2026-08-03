@@ -47,8 +47,9 @@ python server.py
 RELAY_PORT=8765 python server.py
 ```
 
-Or use the start script (installs dependencies, sets `HOST`/`PORT`,
-and opens/closes the TCP port via the firewall — firewalld, ufw or iptables):
+Or use the start script (creates an isolated `.venv`, installs dependencies,
+sets `HOST`/`PORT`, and opens/closes the TCP port via the firewall —
+firewalld, ufw or iptables):
 
 ```bash
 ./start-relay.sh
