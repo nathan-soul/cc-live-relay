@@ -37,6 +37,7 @@ Via environment variables:
 |----------|---------|-------------|
 | `RELAY_HOST` | `0.0.0.0` | Bind address |
 | `RELAY_PORT` | `8765` | Listen port |
+| `DEBUG` | off | Set to `1`/`true`/`yes`/`on` for verbose per-game/per-connection logging |
 
 ## Starting
 

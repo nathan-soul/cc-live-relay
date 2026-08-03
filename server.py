@@ -38,6 +38,28 @@ INACTIVE_GAME_TTL = 60
 DEFAULT_DELAY_SECONDS = int(os.getenv("DEFAULT_DELAY_SECONDS", "15"))
 MAX_DELAY_SECONDS = 600
 
+# Verbose per-game / per-connection logging. Enable with DEBUG=1 (or "true"/"yes"/"on").
+DEBUG = os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def log_debug(*args) -> None:
+    """Print a debug log line only when DEBUG is enabled."""
+    if DEBUG:
+        print(*args)
+
+
+def log_warn(*args) -> None:
+    """Print a warning or error. Always shown, regardless of DEBUG.
+
+    Per-frame traffic (HEADER/PATCH/BODY/CATCHUP) is noise and belongs behind DEBUG, but
+    these are rare and mean something is wrong -- a dropped body chunk, a desync, an
+    unhandled exception in a handler. An operator running without DEBUG still needs them;
+    the BODY gap message even asks the reader to investigate the source, which it cannot
+    do if nobody ever sees it.
+    """
+    print(*args)
+
+
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(title="cc-live-relay", version="0.4.0")
 
@@ -98,9 +120,9 @@ class GameSession:
                 self.header_received = True
                 self.last_active = time.time()
                 should_broadcast = True
-                print(f"[LIVESTREAMER] [HEADER] Game {self.game_hash[:12]}: stored header ({len(payload)} bytes)")
+                log_debug(f"[LIVESTREAMER] [HEADER] Game {self.game_hash[:12]}: stored header ({len(payload)} bytes)")
             elif bytes(self.header) != payload:
-                print(f"[LIVESTREAMER] [WARN] HEADER mismatch from another source for game {self.game_hash[:12]}: "
+                log_warn(f"[LIVESTREAMER] [WARN] HEADER mismatch from another source for game {self.game_hash[:12]}: "
                       f"stored={len(self.header)}B, received={len(payload)}B")
         if should_broadcast:
             await self._broadcast_envelope(MSG_HEADER, payload)
@@ -108,7 +130,7 @@ class GameSession:
     async def apply_patch(self, ws: WebSocket, payload: bytes) -> None:
         """Apply patch to header at given offset, broadcast to observers."""
         if len(payload) < 8:
-            print(f"[LIVESTREAMER] [WARN] PATCH payload too short: {len(payload)} bytes")
+            log_warn(f"[LIVESTREAMER] [WARN] PATCH payload too short: {len(payload)} bytes")
             return
         offset = struct.unpack('<I', payload[0:4])[0]
         patch_len = struct.unpack('<I', payload[4:8])[0]
@@ -120,13 +142,13 @@ class GameSession:
                 self.header.extend(b'\x00' * (needed - len(self.header)))
             self.header[offset:offset + patch_len] = patch_data
             self.last_active = time.time()
-            print(f"[LIVESTREAMER] [PATCH] Game {self.game_hash[:12]}: offset={offset} len={patch_len} header_size={len(self.header)}")
+            log_debug(f"[LIVESTREAMER] [PATCH] Game {self.game_hash[:12]}: offset={offset} len={patch_len} header_size={len(self.header)}")
         await self._broadcast_envelope(MSG_PATCH, payload)
 
     async def apply_body(self, ws: WebSocket, payload: bytes) -> None:
         """Append body data. Payload always has [8B offset uint64 LE][data]."""
         if len(payload) < 8:
-            print(f"[LIVESTREAMER] [WARN] BODY payload too short: {len(payload)} bytes")
+            log_warn(f"[LIVESTREAMER] [WARN] BODY payload too short: {len(payload)} bytes")
             return
 
         offset = struct.unpack('<Q', payload[0:8])[0]
@@ -147,15 +169,15 @@ class GameSession:
                 # would duplicate it.
                 targets = list(self.observer_ws_set)
                 if len(self.body) < 5000 or len(self.body) % 50000 == 0:
-                    print(f"[LIVESTREAMER] [BODY] Game {self.game_hash[:12]}: +{len(data)}B @ offset={offset} total={len(self.body)}")
+                    log_debug(f"[LIVESTREAMER] [BODY] Game {self.game_hash[:12]}: +{len(data)}B @ offset={offset} total={len(self.body)}")
             elif offset < body_len:
                 overlap = min(len(data), body_len - offset)
                 existing = bytes(self.body[offset:offset + overlap])
                 if data[:overlap] != existing:
-                    print(f"[LIVESTREAMER] [WARN] BODY desync for game {self.game_hash[:12]}: "
+                    log_warn(f"[LIVESTREAMER] [WARN] BODY desync for game {self.game_hash[:12]}: "
                           f"offset={offset} overlap={overlap} mismatch!")
             else:
-                print(f"[LIVESTREAMER] [ERROR] BODY gap for game {self.game_hash[:12]}: "
+                log_warn(f"[LIVESTREAMER] [ERROR] BODY gap for game {self.game_hash[:12]}: "
                       f"offset={offset} > body_len={body_len} — dropping, investigate source")
 
         if should_broadcast:
@@ -172,7 +194,7 @@ class GameSession:
         with open(filename, "wb") as f:
             f.write(bytes(self.header))
             f.write(bytes(self.body))
-        print(f"[LIVESTREAMER] [SAVE] Wrote {filename} ({len(self.header)}+{len(self.body)} bytes)")
+        log_debug(f"[LIVESTREAMER] [SAVE] Wrote {filename} ({len(self.header)}+{len(self.body)} bytes)")
 
     # ── Source lifecycle ─────────────────────────────────────────────────
 
@@ -186,14 +208,14 @@ class GameSession:
                 self.ended = True
                 should_broadcast_end = True
                 should_save = True
-                print(f"[LIVESTREAMER] [END] Game {self.game_hash[:12]}: all sources gone, END was received")
+                log_debug(f"[LIVESTREAMER] [END] Game {self.game_hash[:12]}: all sources gone, END was received")
             elif not self.sources:
                 self.ended = True
                 should_save = True
-                print(f"[LIVESTREAMER] [SOURCE_GONE] Game {self.game_hash[:12]}: last source disconnected"
+                log_debug(f"[LIVESTREAMER] [SOURCE_GONE] Game {self.game_hash[:12]}: last source disconnected"
                       f" ({len(self.sources)} remaining)")
             else:
-                print(f"[LIVESTREAMER] [SOURCE_GONE] source disconnected from game {self.game_hash[:12]}... "
+                log_debug(f"[LIVESTREAMER] [SOURCE_GONE] source disconnected from game {self.game_hash[:12]}... "
                       f"({len(self.sources)} remaining)")
         if should_save:
             self.save_replay()
@@ -288,7 +310,7 @@ class GameSession:
         if ended_snapshot:
             await ws.send_bytes(pack_frame(MSG_END, b''))
 
-        print(f"[OBSERVER] [CATCHUP] Sent header ({len(header_snapshot)}B) + body ({len(body_snapshot)}B, offset={last_offset}) to observer")
+        log_debug(f"[OBSERVER] [CATCHUP] Sent header ({len(header_snapshot)}B) + body ({len(body_snapshot)}B, offset={last_offset}) to observer")
 
     # ── Broadcast ────────────────────────────────────────────────────────
 
@@ -310,7 +332,7 @@ class GameSession:
                 async with lock:
                     await ws.send_bytes(frame)
             except Exception as e:
-                print(f"[OBSERVER] [WARN] send to observer failed ({type(e).__name__}: {e}), marking dead")
+                log_warn(f"[OBSERVER] [WARN] send to observer failed ({type(e).__name__}: {e}), marking dead")
                 dead.append(ws)
         for ws in dead:
             async with self._lock:
@@ -415,16 +437,16 @@ async def register_endpoint(websocket: WebSocket):
             return
 
         raw_bytes = msg["bytes"]
-        print(f"[LIVESTREAMER] [REGISTER_RAW] {len(raw_bytes)} bytes: {raw_bytes[:80].hex()} ...")
+        log_debug(f"[LIVESTREAMER] [REGISTER_RAW] {len(raw_bytes)} bytes: {raw_bytes[:80].hex()} ...")
         msg_type, payload = unpack_frame(raw_bytes)
-        print(f"[LIVESTREAMER] [REGISTER_DECODE] type={msg_type} payload_len={len(payload) if payload else 0}")
+        log_debug(f"[LIVESTREAMER] [REGISTER_DECODE] type={msg_type} payload_len={len(payload) if payload else 0}")
         if msg_type != MSG_REGISTER or not payload:
             await websocket.send_bytes(pack_frame(MSG_ERROR, b"Expected REGISTER message (type=0)"))
             await websocket.close()
             return
 
         reg_text = payload.decode("utf-8", errors="replace")
-        print(f"[LIVESTREAMER] [REGISTER] received: {repr(reg_text[:200])}")
+        log_debug(f"[LIVESTREAMER] [REGISTER] received: {repr(reg_text[:200])}")
         try:
             reg = json.loads(reg_text)
         except json.JSONDecodeError:
@@ -455,10 +477,23 @@ async def register_endpoint(websocket: WebSocket):
         # were simply never stored, so the game list rendered blank Map and Players
         # columns. Take them from any client, streamer or not — an observer-only client
         # still knows the map, and whoever registers first populates it.
+        # m_mapName is a path like "Maps/Tournament Desert/Tournament Desert.map"; the
+        # browser wants something readable, and stripping it here keeps the client dumb.
         map_name = reg.get("map_name", "")
         if map_name and not session.map_name:
-            session.map_name = map_name
-        if player_name and player_name not in session.players:
+            leaf = map_name.replace("\\", "/").rstrip("/").split("/")[-1]
+            if leaf.lower().endswith(".map"):
+                leaf = leaf[:-4]
+            session.map_name = leaf or map_name
+
+        # Prefer the full roster; fall back to the single local name that older clients
+        # send, so a mixed-version lobby still lists something.
+        roster = reg.get("players")
+        if isinstance(roster, list) and roster:
+            for name in roster:
+                if isinstance(name, str) and name and name not in session.players:
+                    session.players.append(name)
+        elif player_name and player_name not in session.players:
             session.players.append(player_name)
 
         if can_stream:
@@ -469,10 +504,10 @@ async def register_endpoint(websocket: WebSocket):
             if raw_delay is not None:
                 try:
                     session.delay_seconds = max(0, min(int(raw_delay), MAX_DELAY_SECONDS))
-                    print(f"[LIVESTREAMER] [DELAY] Game {session.game_hash[:12]}: "
+                    log_debug(f"[LIVESTREAMER] [DELAY] Game {session.game_hash[:12]}: "
                           f"delay_seconds={session.delay_seconds}")
                 except (TypeError, ValueError):
-                    print(f"[LIVESTREAMER] [WARN] bad delay_seconds={raw_delay!r}, "
+                    log_warn(f"[LIVESTREAMER] [WARN] bad delay_seconds={raw_delay!r}, "
                           f"keeping {session.delay_seconds}")
             async with session._lock:
                 session.sources.add(websocket)
@@ -483,7 +518,7 @@ async def register_endpoint(websocket: WebSocket):
         role_json = json.dumps({"role": role, "game_id": session.game_id,
             "body_offset": len(session.body)}, separators=(',', ':'))
         await websocket.send_bytes(pack_frame(MSG_ROLE, role_json.encode()))
-        print(f"[LIVESTREAMER] [REGISTER] {player_name} -> role={role} game={session.game_hash[:12]}...")
+        log_debug(f"[LIVESTREAMER] [REGISTER] {player_name} -> role={role} game={session.game_hash[:12]}...")
 
         # ── Enter loop ─────────────────────────────────────────────────
         if role == "streamer":
@@ -492,9 +527,9 @@ async def register_endpoint(websocket: WebSocket):
             await _keep_alive(websocket)
 
     except WebSocketDisconnect:
-        print(f"[LIVESTREAMER] [DISCONNECT] Client disconnected (role={role})")
+        log_debug(f"[LIVESTREAMER] [DISCONNECT] Client disconnected (role={role})")
     except Exception as e:
-        print(f"[LIVESTREAMER] [ERROR] /register error: {e}")
+        log_warn(f"[LIVESTREAMER] [ERROR] /register error: {e}")
         try:
             await websocket.send_bytes(pack_frame(MSG_ERROR, f"Internal error: {e}".encode()))
         except Exception:
@@ -529,7 +564,7 @@ async def _source_loop(ws: WebSocket, session: GameSession) -> None:
         elif msg_type == MSG_END:
             async with session._lock:
                 session.end_received = True
-            print(f"[LIVESTREAMER] [END] Source sent END for game {session.game_hash[:12]}")
+            log_debug(f"[LIVESTREAMER] [END] Source sent END for game {session.game_hash[:12]}")
             break
 
 
@@ -568,7 +603,7 @@ async def watch_game(websocket: WebSocket, game_id: str):
         await websocket.close()
         return
 
-    print(f"[OBSERVER] [WATCH] Observer connected to game {game_id[:12]}... ({len(session.observer_ws_set)} viewers)")
+    log_debug(f"[OBSERVER] [WATCH] Observer connected to game {game_id[:12]}... ({len(session.observer_ws_set)} viewers)")
 
     try:
         # add_observer handed us the send lock already held, so live broadcasts queue
@@ -584,9 +619,9 @@ async def watch_game(websocket: WebSocket, game_id: str):
                 break
 
     except WebSocketDisconnect:
-        print(f"[OBSERVER] [WATCH] Observer disconnected from game {game_id[:12]}")
+        log_debug(f"[OBSERVER] [WATCH] Observer disconnected from game {game_id[:12]}")
     except Exception as e:
-        print(f"[OBSERVER] [WATCH] Observer error: {e}")
+        log_debug(f"[OBSERVER] [WATCH] Observer error: {e}")
     finally:
         await session.remove_observer(websocket)
 
@@ -638,7 +673,7 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
             await session.send_catchup(websocket, last_offset=last_offset, held_lock=send_lock)
         finally:
             send_lock.release()
-        print(f"[OBSERVER] [RECONNECT] Sent body from offset {last_offset} (total body: {len(session.body)} bytes)")
+        log_debug(f"[OBSERVER] [RECONNECT] Sent body from offset {last_offset} (total body: {len(session.body)} bytes)")
 
         while True:
             msg = await websocket.receive()
@@ -646,9 +681,9 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
                 break
 
     except WebSocketDisconnect:
-        print(f"[OBSERVER] [RECONNECT] Observer disconnected from game {game_id[:12]}")
+        log_debug(f"[OBSERVER] [RECONNECT] Observer disconnected from game {game_id[:12]}")
     except Exception as e:
-        print(f"[OBSERVER] [RECONNECT] Observer error: {e}")
+        log_debug(f"[OBSERVER] [RECONNECT] Observer error: {e}")
     finally:
         await session.remove_observer(websocket)
 
@@ -679,7 +714,7 @@ async def _cleanup_loop():
                     await session._broadcast_envelope(MSG_END, b'')
                 except Exception:
                     pass
-                print(f"[LIVESTREAMER] [CLEANUP] Removed game {game_hash[:12]}...")
+                log_debug(f"[LIVESTREAMER] [CLEANUP] Removed game {game_hash[:12]}...")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
