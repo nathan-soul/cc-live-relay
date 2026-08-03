@@ -1,72 +1,90 @@
 # cc-live-relay
 
-Live game relay server voor Command & Conquer: Generals Zero Hour.
+Live game relay server for Command & Conquer: Generals Zero Hour.
 
-## Architectuur
+## Architecture
 
 ```
-Streamer (game client) → Relay (deze server) → Observer (web client)
+Streamer (game client) → Relay (this server) → Observer (web client)
 ```
 
-De relay server ontvangt game data van een streamer (speler in het spel)
-en stuurt deze door naar observers (kijkers). De streamer bepaalt wie
-er mag streamen (out-of-band selectie).
+The relay server receives game data from a streamer (a player in the game)
+and forwards it to observers (viewers). The streamer decides who is allowed
+to stream (out-of-band selection).
 
-## Protocollen
+## Protocols
 
-### Streamer selectie (out-of-band)
-De streamer wordt geselecteerd door de relay server, niet door het spel.
-Dit voorkomt dat spelers elkaar kunnen zien in-game.
+### Streamer selection (out-of-band)
+The streamer is selected by the relay server, not by the game.
+This prevents players from seeing each other in-game.
 
 ### Game hash
-Elke game krijgt een deterministische hash:
+Every game gets a deterministic hash:
 ```
 SHA256(map|mode|start_time|sorted_players)
 ```
-Alle clients hebben dezelfde data, dus dezelfde hash.
+All clients have the same data, so the same hash.
 
 ### Failover
-Bij disconnect van de streamer neemt een backup client over.
-De relay detecteert dit automatisch.
+When the streamer disconnects, a backup client takes over.
+The relay detects this automatically.
 
-## Configuratie
+## Configuration
 
 Via environment variables:
 
-| Variabel | Default | Beschrijving |
-|----------|---------|--------------|
-| `RELAY_HOST` | `0.0.0.0` | Bind adres |
-| `RELAY_PORT` | `8765` | Luister poort |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_HOST` | `0.0.0.0` | Bind address |
+| `RELAY_PORT` | `8765` | Listen port |
 
-## Starten
+## Starting
 
 ```bash
 pip install -r requirements.txt
 python server.py
-# of
+# or
 RELAY_PORT=8765 python server.py
 ```
 
-## WebSocket endpoints
+Or use the start script (installs dependencies, sets `HOST`/`PORT`,
+and opens/closes the TCP port via the firewall — firewalld, ufw or iptables):
 
-| Endpoint | Type | Beschrijving |
-|----------|------|--------------|
+```bash
+./start-relay.sh
+# or with custom host/port
+./start-relay.sh 8765 0.0.0.0
+```
+
+The port is opened before the relay starts and closed again automatically
+when the relay exits or crashes. Pre-existing firewall rules are left
+untouched. Firewall commands run through `sudo` (only when not already root);
+the relay itself runs as your normal user.
+
+## Endpoints
+
+All endpoints are served on the same port. Streamers and observers connect to
+the same host/port, only differing by path.
+
+| Endpoint | Type | Description |
+|----------|------|-------------|
 | `GET /health` | HTTP | Health check |
-| `GET /games` | HTTP | Lijst actieve games |
-| `WS /register` | WebSocket | Streamer registreert zich |
-| `WS /stream/{game_id}` | WebSocket | Streamer stuurt frames |
-| `WS /watch/{game_id}` | WebSocket | Observer kijkt mee |
+| `GET /games` | HTTP | List of active games |
+| `GET /debug/body/{game_id}` | HTTP | Inspect raw body bytes (debugging) |
+| `WS /register` | WebSocket | Client registers with a binary REGISTER frame; becomes a streamer or observer based on `can_stream` — streamers send HEADER/PATCH/BODY/END frames over this connection |
+| `WS /watch/{game_id}` | WebSocket | Observer watches a game (catch-up + live stream) |
+| `WS /watch-reconnect/{game_id}` | WebSocket | Observer reconnects with a `last_offset` hint |
 
 ## Development
 
-Dit is een skeleton — de basisstructuur staat, maar de volledige
-implementatie (frame buffer, failover, command serialisatie) komt later.
+This is a skeleton — the basic structure is in place, but the full
+implementation (frame buffer, failover, command serialization) comes later.
 
 ### Frame buffer
-- Ring buffer van 900 frames (30 seconden × 30 fps)
-- Observers kunnen "seeken" naar eerdere frames
-- Wordt opgeslagen in geheugen (later: Redis/disk)
+- Ring buffer of 900 frames (30 seconds × 30 fps)
+- Observers can "seek" to earlier frames
+- Stored in memory (later: Redis/disk)
 
-### Command serialisatie
-- Gebaseerd op Recorder::writeToFile formaat
-- Hergebruikt hetzelfde binary protocol als de originele game
+### Command serialization
+- Based on the Recorder::writeToFile format
+- Reuses the same binary protocol as the original game

@@ -1,9 +1,9 @@
 """
-cc-live-relay — Live game relay server voor Generals Zero Hour
+cc-live-relay — Live game relay server for Generals Zero Hour
 
-Architectuur: Source → Relay → Observer
-WebSocket-based relay met binair envelope protocol (msg types 0-6).
-Gealigneerd met C++ LiveStreamer/LiveObserver client (libcurl websockets).
+Architecture: Source → Relay → Observer
+WebSocket-based relay with binary envelope protocol (msg types 0-6).
+Aligned with the C++ LiveStreamer/LiveObserver client (libcurl websockets).
 """
 
 import asyncio
@@ -24,9 +24,9 @@ MSG_END      = 4
 MSG_ROLE     = 5
 MSG_ERROR    = 6
 
-CHUNK_SIZE = 256 * 1024  # 256 KB per chunk voor observer catch-up
+CHUNK_SIZE = 256 * 1024  # 256 KB per chunk for observer catch-up
 
-# ── Configuratie via environment variables ─────────────────────────────────
+# ── Configuration via environment variables ────────────────────────────────
 PORT = int(os.getenv("PORT", "8765"))
 MAX_OBSERVERS_PER_GAME = int(os.getenv("MAX_OBSERVERS_PER_GAME", "200"))
 INACTIVE_GAME_TTL = 60
@@ -321,13 +321,13 @@ async def list_games():
 @app.websocket("/register")
 async def register_endpoint(websocket: WebSocket):
     """
-    Source registreert zich hier. Elke client met can_stream=True wordt source.
-    Geen streamer/backup onderscheid meer — iedereen stuurt continu.
+    A source registers here. Any client with can_stream=True becomes a source.
+    No more streamer/backup distinction — everyone sends continuously.
 
     Protocol (binary):
-    1. Client stuurt REGISTER frame (type=0), payload = JSON met game_hash/can_stream/player_name
-    2. Server stuurt ROLE frame (type=5), payload = JSON {"role":"streamer","game_id":"..."}
-    3. Source stuurt HEADER (type=1), daarna PATCH/BODY/END (type=2/3/4)
+    1. Client sends REGISTER frame (type=0), payload = JSON with game_hash/can_stream/player_name
+    2. Server sends ROLE frame (type=5), payload = JSON {"role":"streamer","game_id":"..."}
+    3. Source sends HEADER (type=1), then PATCH/BODY/END (type=2/3/4)
     """
     await websocket.accept()
     session: Optional[GameSession] = None
@@ -453,11 +453,11 @@ async def _keep_alive(ws: WebSocket) -> None:
 @app.websocket("/watch/{game_id}")
 async def watch_game(websocket: WebSocket, game_id: str):
     """
-    Observer verbindt om een game te bekijken.
+    An observer connects to watch a game.
 
     Protocol (binary):
-    1. Server stuurt HEADER (type=1) + BODY chunks (type=3) voor catch-up
-    2. Server streamt live PATCH/BODY/END (type=2/3/4)
+    1. Server sends HEADER (type=1) + BODY chunks (type=3) for catch-up
+    2. Server streams live PATCH/BODY/END (type=2/3/4)
     """
     await websocket.accept()
     session = games.get(game_id)
@@ -498,10 +498,10 @@ async def watch_game(websocket: WebSocket, game_id: str):
 @app.websocket("/watch-reconnect/{game_id}")
 async def watch_reconnect(websocket: WebSocket, game_id: str):
     """
-    Observer reconnect met last_offset hint.
+    Observer reconnects with a last_offset hint.
 
-    Client stuurt: {"type": "reconnect", "last_offset": 12345} (JSON text)
-    Server stuurt: HEADER + BODY[last_offset:] + live stream (binary).
+    Client sends: {"type": "reconnect", "last_offset": 12345} (JSON text)
+    Server sends: HEADER + BODY[last_offset:] + live stream (binary).
     """
     await websocket.accept()
     session = games.get(game_id)
