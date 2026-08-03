@@ -89,9 +89,9 @@ class GameSession:
                 self.header_received = True
                 self.last_active = time.time()
                 should_broadcast = True
-                print(f"[HEADER] Game {self.game_hash[:12]}: stored header ({len(payload)} bytes)")
+                print(f"[LIVESTREAMER] [HEADER] Game {self.game_hash[:12]}: stored header ({len(payload)} bytes)")
             elif bytes(self.header) != payload:
-                print(f"[WARN] HEADER mismatch from another source for game {self.game_hash[:12]}: "
+                print(f"[LIVESTREAMER] [WARN] HEADER mismatch from another source for game {self.game_hash[:12]}: "
                       f"stored={len(self.header)}B, received={len(payload)}B")
         if should_broadcast:
             await self._broadcast_envelope(MSG_HEADER, payload)
@@ -99,7 +99,7 @@ class GameSession:
     async def apply_patch(self, ws: WebSocket, payload: bytes) -> None:
         """Apply patch to header at given offset, broadcast to observers."""
         if len(payload) < 8:
-            print(f"[WARN] PATCH payload too short: {len(payload)} bytes")
+            print(f"[LIVESTREAMER] [WARN] PATCH payload too short: {len(payload)} bytes")
             return
         offset = struct.unpack('<I', payload[0:4])[0]
         patch_len = struct.unpack('<I', payload[4:8])[0]
@@ -111,13 +111,13 @@ class GameSession:
                 self.header.extend(b'\x00' * (needed - len(self.header)))
             self.header[offset:offset + patch_len] = patch_data
             self.last_active = time.time()
-            print(f"[PATCH] Game {self.game_hash[:12]}: offset={offset} len={patch_len} header_size={len(self.header)}")
+            print(f"[LIVESTREAMER] [PATCH] Game {self.game_hash[:12]}: offset={offset} len={patch_len} header_size={len(self.header)}")
         await self._broadcast_envelope(MSG_PATCH, payload)
 
     async def apply_body(self, ws: WebSocket, payload: bytes) -> None:
         """Append body data. Payload always has [8B offset uint64 LE][data]."""
         if len(payload) < 8:
-            print(f"[WARN] BODY payload too short: {len(payload)} bytes")
+            print(f"[LIVESTREAMER] [WARN] BODY payload too short: {len(payload)} bytes")
             return
 
         offset = struct.unpack('<Q', payload[0:8])[0]
@@ -132,15 +132,15 @@ class GameSession:
                 self.last_active = time.time()
                 should_broadcast = True
                 if len(self.body) < 5000 or len(self.body) % 50000 == 0:
-                    print(f"[BODY] Game {self.game_hash[:12]}: +{len(data)}B @ offset={offset} total={len(self.body)}")
+                    print(f"[LIVESTREAMER] [BODY] Game {self.game_hash[:12]}: +{len(data)}B @ offset={offset} total={len(self.body)}")
             elif offset < body_len:
                 overlap = min(len(data), body_len - offset)
                 existing = bytes(self.body[offset:offset + overlap])
                 if data[:overlap] != existing:
-                    print(f"[WARN] BODY desync for game {self.game_hash[:12]}: "
+                    print(f"[LIVESTREAMER] [WARN] BODY desync for game {self.game_hash[:12]}: "
                           f"offset={offset} overlap={overlap} mismatch!")
             else:
-                print(f"[ERROR] BODY gap for game {self.game_hash[:12]}: "
+                print(f"[LIVESTREAMER] [ERROR] BODY gap for game {self.game_hash[:12]}: "
                       f"offset={offset} > body_len={body_len} — dropping, investigate source")
 
         if should_broadcast:
@@ -157,7 +157,7 @@ class GameSession:
         with open(filename, "wb") as f:
             f.write(bytes(self.header))
             f.write(bytes(self.body))
-        print(f"[SAVE] Wrote {filename} ({len(self.header)}+{len(self.body)} bytes)")
+        print(f"[LIVESTREAMER] [SAVE] Wrote {filename} ({len(self.header)}+{len(self.body)} bytes)")
 
     # ── Source lifecycle ─────────────────────────────────────────────────
 
@@ -171,14 +171,14 @@ class GameSession:
                 self.ended = True
                 should_broadcast_end = True
                 should_save = True
-                print(f"[END] Game {self.game_hash[:12]}: all sources gone, END was received")
+                print(f"[LIVESTREAMER] [END] Game {self.game_hash[:12]}: all sources gone, END was received")
             elif not self.sources:
                 self.ended = True
                 should_save = True
-                print(f"[SOURCE_GONE] Game {self.game_hash[:12]}: last source disconnected"
+                print(f"[LIVESTREAMER] [SOURCE_GONE] Game {self.game_hash[:12]}: last source disconnected"
                       f" ({len(self.sources)} remaining)")
             else:
-                print(f"[SOURCE_GONE] source disconnected from game {self.game_hash[:12]}... "
+                print(f"[LIVESTREAMER] [SOURCE_GONE] source disconnected from game {self.game_hash[:12]}... "
                       f"({len(self.sources)} remaining)")
         if should_save:
             self.save_replay()
@@ -229,6 +229,8 @@ class GameSession:
             if ended_snapshot:
                 await ws.send_bytes(pack_frame(MSG_END, b''))
 
+        print(f"[OBSERVER] [CATCHUP] Sent header ({len(header_snapshot)}B) + body ({len(body_snapshot)}B, offset={last_offset}) to observer")
+
     # ── Broadcast ────────────────────────────────────────────────────────
 
     async def _broadcast_envelope(self, msg_type: int, payload: bytes) -> None:
@@ -243,7 +245,7 @@ class GameSession:
                 async with lock:
                     await ws.send_bytes(frame)
             except Exception as e:
-                print(f"[WARN] send to observer failed ({type(e).__name__}: {e}), marking dead")
+                print(f"[OBSERVER] [WARN] send to observer failed ({type(e).__name__}: {e}), marking dead")
                 dead.append(ws)
         for ws in dead:
             async with self._lock:
@@ -339,16 +341,16 @@ async def register_endpoint(websocket: WebSocket):
             return
 
         raw_bytes = msg["bytes"]
-        print(f"[REGISTER_RAW] {len(raw_bytes)} bytes: {raw_bytes[:80].hex()} ...")
+        print(f"[LIVESTREAMER] [REGISTER_RAW] {len(raw_bytes)} bytes: {raw_bytes[:80].hex()} ...")
         msg_type, payload = unpack_frame(raw_bytes)
-        print(f"[REGISTER_DECODE] type={msg_type} payload_len={len(payload) if payload else 0}")
+        print(f"[LIVESTREAMER] [REGISTER_DECODE] type={msg_type} payload_len={len(payload) if payload else 0}")
         if msg_type != MSG_REGISTER or not payload:
             await websocket.send_bytes(pack_frame(MSG_ERROR, b"Expected REGISTER message (type=0)"))
             await websocket.close()
             return
 
         reg_text = payload.decode("utf-8", errors="replace")
-        print(f"[REGISTER] received: {repr(reg_text[:200])}")
+        print(f"[LIVESTREAMER] [REGISTER] received: {repr(reg_text[:200])}")
         try:
             reg = json.loads(reg_text)
         except json.JSONDecodeError:
@@ -386,7 +388,7 @@ async def register_endpoint(websocket: WebSocket):
         role_json = json.dumps({"role": role, "game_id": session.game_id,
             "body_offset": len(session.body)}, separators=(',', ':'))
         await websocket.send_bytes(pack_frame(MSG_ROLE, role_json.encode()))
-        print(f"[REGISTER] {player_name} -> role={role} game={session.game_hash[:12]}...")
+        print(f"[LIVESTREAMER] [REGISTER] {player_name} -> role={role} game={session.game_hash[:12]}...")
 
         # ── Enter loop ─────────────────────────────────────────────────
         if role == "streamer":
@@ -395,9 +397,9 @@ async def register_endpoint(websocket: WebSocket):
             await _keep_alive(websocket)
 
     except WebSocketDisconnect:
-        print(f"[DISCONNECT] Client disconnected (role={role})")
+        print(f"[LIVESTREAMER] [DISCONNECT] Client disconnected (role={role})")
     except Exception as e:
-        print(f"[ERROR] /register error: {e}")
+        print(f"[LIVESTREAMER] [ERROR] /register error: {e}")
         try:
             await websocket.send_bytes(pack_frame(MSG_ERROR, f"Internal error: {e}".encode()))
         except Exception:
@@ -432,7 +434,7 @@ async def _source_loop(ws: WebSocket, session: GameSession) -> None:
         elif msg_type == MSG_END:
             async with session._lock:
                 session.end_received = True
-            print(f"[END] Source sent END for game {session.game_hash[:12]}")
+            print(f"[LIVESTREAMER] [END] Source sent END for game {session.game_hash[:12]}")
             break
 
 
@@ -471,7 +473,7 @@ async def watch_game(websocket: WebSocket, game_id: str):
         await websocket.close()
         return
 
-    print(f"[WATCH] Observer connected to game {game_id[:12]}... ({len(session.observer_ws_set)} viewers)")
+    print(f"[OBSERVER] [WATCH] Observer connected to game {game_id[:12]}... ({len(session.observer_ws_set)} viewers)")
 
     try:
         await session.send_catchup(websocket, last_offset=0)
@@ -482,9 +484,9 @@ async def watch_game(websocket: WebSocket, game_id: str):
                 break
 
     except WebSocketDisconnect:
-        print(f"[WATCH] Observer disconnected from game {game_id[:12]}")
+        print(f"[OBSERVER] [WATCH] Observer disconnected from game {game_id[:12]}")
     except Exception as e:
-        print(f"[WATCH] Observer error: {e}")
+        print(f"[OBSERVER] [WATCH] Observer error: {e}")
     finally:
         await session.remove_observer(websocket)
 
@@ -533,7 +535,7 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
         })
 
         await session.send_catchup(websocket, last_offset=last_offset)
-        print(f"[RECONNECT] Sent body from offset {last_offset} (total body: {len(session.body)} bytes)")
+        print(f"[OBSERVER] [RECONNECT] Sent body from offset {last_offset} (total body: {len(session.body)} bytes)")
 
         while True:
             msg = await websocket.receive()
@@ -541,9 +543,9 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
                 break
 
     except WebSocketDisconnect:
-        print(f"[RECONNECT] Observer disconnected from game {game_id[:12]}")
+        print(f"[OBSERVER] [RECONNECT] Observer disconnected from game {game_id[:12]}")
     except Exception as e:
-        print(f"[RECONNECT] Observer error: {e}")
+        print(f"[OBSERVER] [RECONNECT] Observer error: {e}")
     finally:
         await session.remove_observer(websocket)
 
@@ -574,7 +576,7 @@ async def _cleanup_loop():
                     await session._broadcast_envelope(MSG_END, b'')
                 except Exception:
                     pass
-                print(f"[CLEANUP] Removed game {game_hash[:12]}...")
+                print(f"[LIVESTREAMER] [CLEANUP] Removed game {game_hash[:12]}...")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
