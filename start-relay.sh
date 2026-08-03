@@ -2,18 +2,14 @@
 set -eu
 
 PORT="${1:-8765}"
-LISTEN_HOST="${2:-127.0.0.1}"
-
-# Ports to open for the reverse proxy (Traefik/nginx). The relay port itself
-# is NOT exposed to the outside world — the proxy reaches it on localhost.
-FW_PORTS="${FW_PORTS:-80 443}"
+LISTEN_HOST="${2:-0.0.0.0}"
 
 RELAY_DIR=$(CDPATH= cd "$(dirname "$0")" && pwd)
 VENV_DIR="$RELAY_DIR/.venv"
 
 # --- Firewall helpers ---------------------------------------------------------
-# Open the proxy ports so clients can reach the reverse proxy, and close them
-# again when the relay exits or crashes. Pre-existing rules are left untouched.
+# Open TCP ${PORT} so players can reach the relay, and close it again when the
+# relay exits or crashes. A pre-existing rule is left untouched.
 
 # Firewall commands need root, so use sudo unless already running as root.
 SUDO=""
@@ -46,36 +42,35 @@ fi
 
 port_is_open() {
     case "$FW_TOOL" in
-        firewalld) $SUDO firewall-cmd --query-port="$1/tcp" >/dev/null 2>&1 ;;
-        ufw)       $SUDO ufw status 2>/dev/null | grep -q "$1/tcp" ;;
-        iptables)  $SUDO iptables -C INPUT -p tcp --dport "$1" -j ACCEPT >/dev/null 2>&1 ;;
+        firewalld) $SUDO firewall-cmd --query-port="${PORT}/tcp" >/dev/null 2>&1 ;;
+        ufw)       $SUDO ufw status 2>/dev/null | grep -q "${PORT}/tcp" ;;
+        iptables)  $SUDO iptables -C INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1 ;;
         *)         return 1 ;;
     esac
 }
 
 open_port() {
     case "$FW_TOOL" in
-        firewalld) $SUDO firewall-cmd --add-port="$1/tcp" >/dev/null 2>&1 ;;
-        ufw)       $SUDO ufw allow "$1/tcp" >/dev/null 2>&1 ;;
-        iptables)  $SUDO iptables -A INPUT -p tcp --dport "$1" -j ACCEPT >/dev/null 2>&1 ;;
+        firewalld) $SUDO firewall-cmd --add-port="${PORT}/tcp" >/dev/null 2>&1 ;;
+        ufw)       $SUDO ufw allow "${PORT}/tcp" >/dev/null 2>&1 ;;
+        iptables)  $SUDO iptables -A INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1 ;;
     esac
 }
 
 close_port() {
     case "$FW_TOOL" in
-        firewalld) $SUDO firewall-cmd --remove-port="$1/tcp" >/dev/null 2>&1 ;;
-        ufw)       $SUDO ufw delete allow "$1/tcp" >/dev/null 2>&1 ;;
-        iptables)  $SUDO iptables -D INPUT -p tcp --dport "$1" -j ACCEPT >/dev/null 2>&1 ;;
+        firewalld) $SUDO firewall-cmd --remove-port="${PORT}/tcp" >/dev/null 2>&1 ;;
+        ufw)       $SUDO ufw delete allow "${PORT}/tcp" >/dev/null 2>&1 ;;
+        iptables)  $SUDO iptables -D INPUT -p tcp --dport "${PORT}" -j ACCEPT >/dev/null 2>&1 ;;
     esac
 }
 
-# Space-separated list of ports we opened; closed again on exit/crash.
-OPENED=""
+OPENED=0
 cleanup() {
-    for p in $OPENED; do
-        echo "Closing port ${p}/tcp ..."
-        close_port "$p"
-    done
+    if [ "$OPENED" = "1" ]; then
+        echo "Closing port ${PORT}/tcp ..."
+        close_port
+    fi
 }
 trap cleanup EXIT
 
@@ -117,22 +112,20 @@ if ! "$VENV_DIR/bin/python" -m pip install -q -r "$RELAY_DIR/requirements.txt"; 
     exit 1
 fi
 
-# --- Firewall ports -------------------------------------------------------------
+# --- Firewall port -------------------------------------------------------------
 
 if [ -z "$FW_TOOL" ]; then
     echo "No firewall tool found (firewalld/ufw/iptables). Skipping port opening."
+elif port_is_open; then
+    echo "Port ${PORT}/tcp is already open."
 else
-    for p in $FW_PORTS; do
-        if port_is_open "$p"; then
-            echo "Port ${p}/tcp is already open."
-        elif open_port "$p"; then
-            OPENED="$OPENED $p"
-            echo "Opened port ${p}/tcp."
-        else
-            echo "WARNING: could not open port ${p}/tcp with $FW_TOOL."
-            echo "         Check that sudo works for ${FW_TOOL} without a password prompt."
-        fi
-    done
+    echo "Opening port ${PORT}/tcp for incoming players ..."
+    if open_port; then
+        OPENED=1
+    else
+        echo "WARNING: could not open port ${PORT}/tcp with $FW_TOOL."
+        echo "         Check that sudo works for ${FW_TOOL} without a password prompt."
+    fi
 fi
 
 # --- Run the relay -------------------------------------------------------------
@@ -141,7 +134,7 @@ cd "$RELAY_DIR"
 export HOST="$LISTEN_HOST"
 export PORT="$PORT"
 
-echo "Starting relay on $LISTEN_HOST:$PORT (reachable via the reverse proxy only) ..."
+echo "Starting relay on $LISTEN_HOST:$PORT ..."
 "$VENV_DIR/bin/python" server.py &
 PY_PID=$!
 

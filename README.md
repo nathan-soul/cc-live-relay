@@ -48,20 +48,17 @@ RELAY_PORT=8765 python server.py
 ```
 
 Or use the start script (creates an isolated `.venv`, installs dependencies,
-sets `HOST`/`PORT`, and opens the reverse-proxy ports via the firewall —
+sets `HOST`/`PORT`, and opens/closes the TCP port via the firewall —
 firewalld, ufw or iptables):
 
 ```bash
 ./start-relay.sh
 # or with custom host/port
-./start-relay.sh 8765 127.0.0.1
+./start-relay.sh 8765 0.0.0.0
 ```
 
-The relay binds to `127.0.0.1` by default and is **not** exposed to the
-outside world — it is meant to run behind a reverse proxy (Traefik, nginx)
-on the same host. The script opens TCP 80 and 443 for the proxy before
-starting and closes them again automatically when the relay exits or crashes
-(override with `FW_PORTS="80 443"`). Pre-existing firewall rules are left
+The port is opened before the relay starts and closed again automatically
+when the relay exits or crashes. Pre-existing firewall rules are left
 untouched. Firewall commands run through `sudo` (only when not already root);
 the relay itself runs as your normal user.
 
