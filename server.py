@@ -31,6 +31,13 @@ PORT = int(os.getenv("PORT", "8765"))
 MAX_OBSERVERS_PER_GAME = int(os.getenv("MAX_OBSERVERS_PER_GAME", "200"))
 INACTIVE_GAME_TTL = 60
 
+# Broadcast delay: how far behind live an observer is held. The streamer owns this value
+# (it is their spoiler window), sends it in REGISTER, and the relay forwards it to every
+# observer before any replay data. Used when a streamer sends nothing, or runs an older
+# build that does not know about the field.
+DEFAULT_DELAY_SECONDS = int(os.getenv("DEFAULT_DELAY_SECONDS", "15"))
+MAX_DELAY_SECONDS = 600
+
 # ── App ────────────────────────────────────────────────────────────────────
 app = FastAPI(title="cc-live-relay", version="0.4.0")
 
@@ -65,6 +72,7 @@ class GameSession:
         self.players: list = []
         self.created_at: float = time.time()
         self.last_active: float = time.time()
+        self.delay_seconds: int = DEFAULT_DELAY_SECONDS
 
         self.header: bytearray = bytearray()
         self.header_received: bool = False
@@ -208,6 +216,7 @@ class GameSession:
             header_snapshot = bytes(self.header)
             body_snapshot = bytes(self.body)
             ended_snapshot = self.ended
+            delay_snapshot = self.delay_seconds
             send_lock = self._observer_send_locks.get(ws)
 
         if send_lock is None:
@@ -215,6 +224,13 @@ class GameSession:
 
         # Serialise sends to this observer against concurrent _broadcast_envelope.
         async with send_lock:
+            # Must precede the HEADER: receiving the header is what starts playback on the
+            # observer, and the pre-roll buffer latches against the delay — a value that
+            # arrived afterwards would be too late to take effect for this session.
+            config_json = json.dumps({"role": "observer", "game_id": self.game_id,
+                "delay_seconds": delay_snapshot}, separators=(',', ':'))
+            await ws.send_bytes(pack_frame(MSG_ROLE, config_json.encode()))
+
             if header_snapshot:
                 await ws.send_bytes(pack_frame(MSG_HEADER, header_snapshot))
 
@@ -379,6 +395,17 @@ async def register_endpoint(websocket: WebSocket):
 
         if can_stream:
             role = "streamer"
+            # The streamer owns the broadcast delay for their game. Take it here, at
+            # REGISTER, so it is settled before any observer can connect.
+            raw_delay = reg.get("delay_seconds")
+            if raw_delay is not None:
+                try:
+                    session.delay_seconds = max(0, min(int(raw_delay), MAX_DELAY_SECONDS))
+                    print(f"[LIVESTREAMER] [DELAY] Game {session.game_hash[:12]}: "
+                          f"delay_seconds={session.delay_seconds}")
+                except (TypeError, ValueError):
+                    print(f"[LIVESTREAMER] [WARN] bad delay_seconds={raw_delay!r}, "
+                          f"keeping {session.delay_seconds}")
             async with session._lock:
                 session.sources.add(websocket)
         else:
