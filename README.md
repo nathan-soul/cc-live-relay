@@ -14,16 +14,36 @@ to stream (out-of-band selection).
 
 ## Protocols
 
-### Streamer selection (out-of-band)
-The streamer is selected by the relay server, not by the game.
-This prevents players from seeing each other in-game.
+### Session key: the GO lobby id
+A session is keyed by the GeneralsOnline **LobbyID**, as decimal text — the same value, in the
+same spelling, that GO's own `/Lobbies` JSON prints. Every player in a lobby already holds it
+identically (it comes off the service, not computed locally), so no client has to derive
+anything, and a relay session can be matched to a GO lobby by eye. It is also the id observers
+watch by: `/watch/<lobbyid>`.
 
-### Game hash
-Every game gets a deterministic hash:
-```
-SHA256(map|mode|start_time|sorted_players)
-```
-All clients have the same data, so the same hash.
+### Host authority
+Every player in a lobby registers, because each is a potential source of replay bytes. Only the
+**host** describes the game: the `lobby` block and `delay_seconds` are accepted from `is_host`
+registrations and ignored from anyone else. Without that rule the published description of a game
+was a race between eight registrations that all arrive within milliseconds of each other.
+
+A session may be opened by whichever client connects first, host or not — rejecting non-hosts
+would drop good sources purely on arrival order. Until the host describes it, the session ingests
+data but is **not listed** by `GET /games`, and is dropped after `UNDESCRIBED_GAME_TTL` if the
+host never registers (which is what happens when the host has streaming switched off).
+
+### Lobby metadata shape
+The `lobby` block mirrors GO's own `/lobby` response key-for-key (`lobbytype`, `region`,
+`rngseed`, `mapname`, `mappath`, `name`, `owner`, `members[{userid, displayname}]`), so a client
+parses the same structure whether the list came from this relay or from GO itself. The relay
+allow-lists those keys: a GO lobby also carries a password, per-member ports and an anticheat id,
+none of which are republished. `members[]` keeps GO's empty slots (`userid: -1`) verbatim —
+filtering those is the display layer's job.
+
+`GET /games` returns those keys flat per row, plus the relay's own `lobbyid`, `timecreated`,
+`viewers`, `delay_seconds`, `age_seconds`, `body_bytes` and `sources`. Note `timecreated` is when
+the **relay session** started (the relay never sees the lobby's own creation time), formatted as
+ISO-8601 UTC to match GO.
 
 ### Failover
 When the streamer disconnects, a backup client takes over.
@@ -38,6 +58,7 @@ Via environment variables:
 | `RELAY_HOST` | `0.0.0.0` | Bind address |
 | `RELAY_PORT` | `8765` | Listen port |
 | `DEBUG` | off | Set to `1`/`true`/`yes`/`on` for verbose per-game/per-connection logging |
+| `UNDESCRIBED_GAME_TTL` | `120` | Seconds a session may run before the host describes it, after which it is dropped |
 
 ## Starting
 
@@ -71,11 +92,11 @@ the same host/port, only differing by path.
 | Endpoint | Type | Description |
 |----------|------|-------------|
 | `GET /health` | HTTP | Health check |
-| `GET /games` | HTTP | List of active games |
-| `GET /debug/body/{game_id}` | HTTP | Inspect raw body bytes (debugging) |
-| `WS /register` | WebSocket | Client registers with a binary REGISTER frame; becomes a streamer or observer based on `can_stream` — streamers send HEADER/PATCH/BODY/END frames over this connection |
-| `WS /watch/{game_id}` | WebSocket | Observer watches a game (catch-up + live stream) |
-| `WS /watch-reconnect/{game_id}` | WebSocket | Observer reconnects with a `last_offset` hint |
+| `GET /games` | HTTP | Active games the host has described (see above) |
+| `GET /debug/body/{lobbyid}` | HTTP | Inspect raw body bytes (debugging) |
+| `WS /register` | WebSocket | Client registers with a binary REGISTER frame carrying `lobbyid`, `can_stream` and `is_host`; becomes a streamer or observer based on `can_stream` — streamers send HEADER/PATCH/BODY/END frames over this connection |
+| `WS /watch/{lobbyid}` | WebSocket | Observer watches a game (catch-up + live stream) |
+| `WS /watch-reconnect/{lobbyid}` | WebSocket | Observer reconnects with a `last_offset` hint |
 
 ## Development
 

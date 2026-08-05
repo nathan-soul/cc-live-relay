@@ -5,13 +5,15 @@ Tests: binary registration, envelope streaming, observer catchup, dual source de
 """
 import asyncio
 import json
+import os
 import struct
 import sys
 import time
 import websockets
 
-BASE = "ws://localhost:8765"
-HTTP = "http://localhost:8765"
+PORT = os.getenv("RELAY_TEST_PORT", "8765")
+BASE = f"ws://localhost:{PORT}"
+HTTP = f"http://localhost:{PORT}"
 
 PASS = 0
 FAIL = 0
@@ -85,9 +87,10 @@ async def test_register_as_source():
     async with websockets.connect(f"{BASE}/register") as ws:
         # Send binary REGISTER frame
         reg_json = json.dumps({
-            "game_hash": "test_game_001",
+            "lobbyid": "test_game_001",
             "player_name": "TestPlayer",
             "can_stream": True,
+            "is_host": True,
         })
         await ws.send(pack_frame(MSG_REGISTER, reg_json.encode()))
 
@@ -97,7 +100,7 @@ async def test_register_as_source():
         assert msg_type == MSG_ROLE, f"Expected ROLE (5), got {msg_type}"
         role_data = json.loads(payload.decode())
         assert role_data["role"] == "streamer"
-        assert role_data["game_id"] == "test_game_001"
+        assert role_data["lobbyid"] == "test_game_001"
         ok("source gets role=streamer via binary ROLE frame")
 
         # Send HEADER
@@ -127,9 +130,10 @@ async def test_observer_receives_data():
     async with websockets.connect(f"{BASE}/register") as sws:
         # Binary REGISTER
         reg_json = json.dumps({
-            "game_hash": "test_game_002",
+            "lobbyid": "test_game_002",
             "player_name": "Streamer1",
             "can_stream": True,
+            "is_host": True,
         })
         await sws.send(pack_frame(MSG_REGISTER, reg_json.encode()))
         raw = await sws.recv()
@@ -178,9 +182,10 @@ async def test_observer_error_on_ended():
     print("\n=== Observer error on ended game ===")
     async with websockets.connect(f"{BASE}/register") as sws:
         reg_json = json.dumps({
-            "game_hash": "test_game_003",
+            "lobbyid": "test_game_003",
             "player_name": "Streamer2",
             "can_stream": True,
+            "is_host": True,
         })
         await sws.send(pack_frame(MSG_REGISTER, reg_json.encode()))
         raw = await sws.recv()
@@ -210,10 +215,30 @@ async def test_observer_error_on_ended():
 async def test_games_list():
     print("\n=== /games (with active game) ===")
     async with websockets.connect(f"{BASE}/register") as sws:
+        # Only a host registration describes a game, and only a described game is listed —
+        # so this one carries the GO-shaped lobby block a real host would send.
         reg_json = json.dumps({
-            "game_hash": "test_game_004",
+            "lobbyid": "test_game_004",
             "player_name": "ListTest",
             "can_stream": True,
+            "is_host": True,
+            "lobby": {
+                "lobbytype": 0,
+                "region": "europe",
+                "rngseed": 1595418308,
+                "owner": 19354,
+                "name": "[eu] list test",
+                "mapname": "! casino island v1_06x.map (4)",
+                "mappath": "! casino island\\! casino island.map",
+                # Secrets a real GO lobby carries; the relay must not republish them.
+                "password": "hunter2",
+                "anticheatid": 4242,
+                "members": [
+                    {"userid": 19354, "displayname": "ListTest", "port": 5000},
+                    {"userid": 34595, "displayname": "Opponent"},
+                    {"userid": -1, "displayname": ""},
+                ],
+            },
         })
         await sws.send(pack_frame(MSG_REGISTER, reg_json.encode()))
         raw = await sws.recv()
@@ -232,12 +257,27 @@ async def test_games_list():
                 data = await r.json()
                 assert isinstance(data, list)
                 assert len(data) >= 1, f"Expected >=1 games, got {len(data)}"
-                matching = [g for g in data if g.get("game_id") == "test_game_004"]
+                matching = [g for g in data if g.get("lobbyid") == "test_game_004"]
                 assert len(matching) == 1, f"Expected test_game_004 in games list, got: {data}"
                 game = matching[0]
                 assert game.get("body_bytes") is not None, "body_bytes field missing"
                 assert game.get("sources") is not None, "sources field missing"
                 ok("/games lists active game with body_bytes + sources fields")
+
+                # GO-shaped metadata comes back on the row itself
+                assert game["name"] == "[eu] list test"
+                assert game["mapname"] == "! casino island v1_06x.map (4)"
+                assert game["rngseed"] == 1595418308
+                assert game["owner"] == 19354
+                assert game["region"] == "europe"
+                assert game["timecreated"].endswith("Z"), game["timecreated"]
+                ok("/games row carries GO-shaped lobby metadata")
+
+                # members[] keeps GO's empty slots verbatim, but nothing secret survives
+                assert [m["userid"] for m in game["members"]] == [19354, 34595, -1]
+                assert all("port" not in m for m in game["members"]), "per-member port leaked"
+                assert "password" not in game and "anticheatid" not in game, "secret leaked"
+                ok("/games strips password/anticheatid/port, keeps GO's empty slots")
 
         # End
         await sws.send(pack_frame(MSG_END, b""))
@@ -249,9 +289,10 @@ async def test_dual_source_dedup():
     # Register source A
     sws_a = await websockets.connect(f"{BASE}/register")
     await sws_a.send(pack_frame(MSG_REGISTER, json.dumps({
-        "game_hash": "test_game_005",
+        "lobbyid": "test_game_005",
         "player_name": "SourceA",
         "can_stream": True,
+        "is_host": True,
     }).encode()))
     raw = await sws_a.recv()
     msg_type, payload = unpack_frame(raw)
@@ -263,9 +304,10 @@ async def test_dual_source_dedup():
     # Register source B (should ALSO be streamer, not backup!)
     sws_b = await websockets.connect(f"{BASE}/register")
     await sws_b.send(pack_frame(MSG_REGISTER, json.dumps({
-        "game_hash": "test_game_005",
+        "lobbyid": "test_game_005",
         "player_name": "SourceB",
         "can_stream": True,
+        "is_host": True,
     }).encode()))
     raw = await sws_b.recv()
     msg_type, payload = unpack_frame(raw)
@@ -337,9 +379,10 @@ async def test_reconnect_with_offset():
     print("\n=== Reconnect with last_offset ===")
     async with websockets.connect(f"{BASE}/register") as sws:
         await sws.send(pack_frame(MSG_REGISTER, json.dumps({
-            "game_hash": "test_game_006",
+            "lobbyid": "test_game_006",
             "player_name": "ReconnectSource",
             "can_stream": True,
+            "is_host": True,
         }).encode()))
         raw = await sws.recv()
         msg_type, payload = unpack_frame(raw)
@@ -386,9 +429,10 @@ async def test_debug_body():
     print("\n=== /debug/body endpoint ===")
     async with websockets.connect(f"{BASE}/register") as sws:
         await sws.send(pack_frame(MSG_REGISTER, json.dumps({
-            "game_hash": "test_game_007",
+            "lobbyid": "test_game_007",
             "player_name": "DebugTest",
             "can_stream": True,
+            "is_host": True,
         }).encode()))
         raw = await sws.recv()
         msg_type, payload = unpack_frame(raw)
@@ -403,7 +447,7 @@ async def test_debug_body():
             async with s.get(f"{HTTP}/debug/body/test_game_007") as r:
                 data = await r.json()
                 assert "error" not in data, f"debug/body returned error: {data}"
-                assert data.get("game_id") == "test_game_007"
+                assert data.get("lobbyid") == "test_game_007"
                 assert data.get("body_bytes", 0) > 0, f"body_bytes should be > 0, got: {data}"
                 assert data.get("header_bytes", 0) > 0, f"header_bytes should be > 0, got: {data}"
                 ok("debug/body returns body_bytes + header_bytes")
@@ -412,18 +456,85 @@ async def test_debug_body():
         await asyncio.sleep(0.2)
 
 
+async def test_host_authority():
+    print("\n=== Host authority: only the host describes a game ===")
+    # A non-host arriving first is normal — every player in a lobby starts within milliseconds
+    # of every other — so it must still open the session and be accepted as a source. What it
+    # must NOT do is describe the game or set its options.
+    async with websockets.connect(f"{BASE}/register") as nonhost:
+        await nonhost.send(pack_frame(MSG_REGISTER, json.dumps({
+            "lobbyid": "test_game_008",
+            "player_name": "NonHost",
+            "can_stream": True,
+            "is_host": False,
+            # Host-only fields, sent by a non-host on purpose: both must be ignored.
+            "lobby": {"name": "IMPOSTER", "mapname": "imposter map", "members": []},
+            "delay_seconds": 599,
+        }).encode()))
+        raw = await nonhost.recv()
+        msg_type, payload = unpack_frame(raw)
+        assert msg_type == MSG_ROLE
+        assert json.loads(payload.decode())["role"] == "streamer"
+        ok("non-host is accepted as a source")
+
+        await nonhost.send(pack_frame(MSG_HEADER, b"NONHOST_HEADER"))
+        await asyncio.sleep(0.2)
+
+        import aiohttp
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{HTTP}/games") as r:
+                data = await r.json()
+                matching = [g for g in data if g.get("lobbyid") == "test_game_008"]
+                assert not matching, f"undescribed game must not be listed, got: {matching}"
+                ok("game with no host registration is not listed")
+
+        # Now the host turns up and describes it.
+        async with websockets.connect(f"{BASE}/register") as host:
+            await host.send(pack_frame(MSG_REGISTER, json.dumps({
+                "lobbyid": "test_game_008",
+                "player_name": "RealHost",
+                "can_stream": True,
+                "is_host": True,
+                "delay_seconds": 42,
+                "lobby": {
+                    "name": "the real lobby", "mapname": "the real map",
+                    "region": "europe", "owner": 19354, "rngseed": 7, "lobbytype": 0,
+                    "mappath": "real.map",
+                    "members": [{"userid": 19354, "displayname": "RealHost"}],
+                },
+            }).encode()))
+            raw = await host.recv()
+            assert unpack_frame(raw)[0] == MSG_ROLE
+            await asyncio.sleep(0.2)
+
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{HTTP}/games") as r:
+                    data = await r.json()
+                    matching = [g for g in data if g.get("lobbyid") == "test_game_008"]
+                    assert len(matching) == 1, f"described game should be listed, got: {data}"
+                    game = matching[0]
+                    assert game["name"] == "the real lobby", game["name"]
+                    assert game["mapname"] == "the real map", game["mapname"]
+                    assert game["delay_seconds"] == 42, game["delay_seconds"]
+                    ok("host description wins; non-host's lobby and delay were ignored")
+
+            await host.send(pack_frame(MSG_END, b""))
+            await asyncio.sleep(0.2)
+
+
 async def test_register_error_missing_hash():
-    print("\n=== Register error: missing game_hash ===")
+    print("\n=== Register error: missing lobbyid ===")
     async with websockets.connect(f"{BASE}/register") as ws:
         await ws.send(pack_frame(MSG_REGISTER, json.dumps({
             "player_name": "BadClient",
             "can_stream": True,
+            "is_host": True,
         }).encode()))
         raw = await asyncio.wait_for(ws.recv(), timeout=2.0)
         if isinstance(raw, bytes):
             t, pl = unpack_frame(raw)
             if t == MSG_ERROR:
-                ok("got ERROR frame for missing game_hash")
+                ok("got ERROR frame for missing lobbyid")
             else:
                 fail("expected ERROR", f"got type={t}")
         else:
@@ -449,6 +560,7 @@ async def main():
         test_dual_source_dedup,
         test_reconnect_with_offset,
         test_debug_body,
+        test_host_authority,
         test_register_error_missing_hash,
     ]
 

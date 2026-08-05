@@ -31,6 +31,10 @@ CHUNK_SIZE = 256 * 1024  # 256 KB per chunk for observer catch-up
 PORT = int(os.getenv("PORT", "8765"))
 MAX_OBSERVERS_PER_GAME = int(os.getenv("MAX_OBSERVERS_PER_GAME", "200"))
 INACTIVE_GAME_TTL = 60
+# How long a session may exist without the host ever describing it before it is dropped. Only
+# the host's REGISTER carries the lobby block, so until it arrives the game cannot be listed or
+# meaningfully watched — see _cleanup_loop.
+UNDESCRIBED_GAME_TTL = int(os.getenv("UNDESCRIBED_GAME_TTL", "120"))
 
 # Broadcast delay: how far behind live an observer is held. The streamer owns this value
 # (it is their spoiler window), sends it in REGISTER, and the relay forwards it to every
@@ -468,6 +472,13 @@ async def list_games():
         if g.ended:
             continue
 
+        # No host registration yet means nothing authoritative is known about this game — only
+        # that someone is pushing bytes for it. Listing it would show a row with a blank name
+        # and no players, so it stays hidden until the host describes it (see UNDESCRIBED_TTL,
+        # which reaps it if the host never does).
+        if not g.lobby:
+            continue
+
         entry = dict(LOBBY_DEFAULTS)
         entry.update(g.lobby)
         entry.update({
@@ -538,6 +549,7 @@ async def register_endpoint(websocket: WebSocket):
         lobby_id = reg.get("lobbyid", "")
         player_name = reg.get("player_name", "unknown")
         can_stream = reg.get("can_stream", False)
+        is_host = bool(reg.get("is_host", False))
 
         if not lobby_id:
             await websocket.send_bytes(pack_frame(MSG_ERROR, b"lobbyid required"))
@@ -545,6 +557,12 @@ async def register_endpoint(websocket: WebSocket):
             return
 
         # ── Assign session ─────────────────────────────────────────────
+        # Any client may open the session, host or not. It is tempting to let only the host
+        # create one and reject the rest, but every player in a lobby starts within
+        # milliseconds of every other, so a non-host routinely arrives first — rejecting it
+        # would drop a perfectly good source over pure arrival order. Instead the session
+        # exists for whoever gets there first and stays *undescribed*, and therefore
+        # unlisted, until the host fills it in below.
         if lobby_id in games:
             session = games[lobby_id]
             if session.ended:
@@ -554,21 +572,20 @@ async def register_endpoint(websocket: WebSocket):
             session = GameSession(lobby_id)
             games[lobby_id] = session
 
-        # ── Descriptive metadata for GET /games ────────────────────────
-        # Take it from any client, streamer or not — an observer-only client still knows
-        # the lobby, and whoever registers first populates it. First-wins: every peer in
-        # the same lobby sends the same block, so later ones have nothing to add.
-        if not session.lobby:
+        # ── Host-authoritative fields ──────────────────────────────────
+        # Only the lobby host describes the game or sets its options. Accepting either from
+        # any client made the published description a race between eight simultaneous
+        # registrations. A host re-registering (reconnect, host migration) overwrites, since
+        # by then it is the authority on what changed.
+        if is_host:
             lobby = sanitize_lobby(reg.get("lobby"))
             if lobby:
                 session.lobby = lobby
-                log_debug(f"[LIVESTREAMER] [REGISTER] lobby '{lobby.get('name', '')}' on "
-                          f"'{lobby.get('mapname', '')}' "
+                log_debug(f"[LIVESTREAMER] [REGISTER] host described lobby "
+                          f"'{lobby.get('name', '')}' on '{lobby.get('mapname', '')}' "
                           f"({len(lobby_player_names(lobby))} players) for {session.lobby_id}")
 
-        if can_stream:
-            role = "streamer"
-            # The streamer owns the broadcast delay for their game. Take it here, at
+            # The host owns the broadcast delay — it is their spoiler window. Taken here, at
             # REGISTER, so it is settled before any observer can connect.
             raw_delay = reg.get("delay_seconds")
             if raw_delay is not None:
@@ -579,6 +596,12 @@ async def register_endpoint(websocket: WebSocket):
                 except (TypeError, ValueError):
                     log_warn(f"[LIVESTREAMER] [WARN] bad delay_seconds={raw_delay!r}, "
                           f"keeping {session.delay_seconds}")
+        elif reg.get("lobby") is not None or reg.get("delay_seconds") is not None:
+            log_warn(f"[LIVESTREAMER] [WARN] non-host {player_name} sent host-only fields for "
+                     f"{session.lobby_id}; ignored")
+
+        if can_stream:
+            role = "streamer"
             async with session._lock:
                 session.sources.add(websocket)
         else:
@@ -768,13 +791,24 @@ async def start_cleanup_task():
 
 
 async def _cleanup_loop():
-    """Periodically remove ended or inactive games."""
+    """Periodically remove ended, inactive, or never-described games."""
     while True:
         await asyncio.sleep(15)
         now = time.time()
         to_remove = []
         for lobby_id, session in games.items():
             if session.ended or (now - session.last_active > INACTIVE_GAME_TTL):
+                to_remove.append(lobby_id)
+                continue
+
+            # A session nobody ever claimed as host can never be listed or watched, but an
+            # active non-host source keeps last_active fresh forever, so the inactivity TTL
+            # above never reaches it. That happens whenever the host has streaming switched
+            # off and another player has it on — bound the wasted upload rather than letting
+            # it run for the whole match.
+            if not session.lobby and (now - session.created_at > UNDESCRIBED_GAME_TTL):
+                log_warn(f"[LIVESTREAMER] [CLEANUP] No host registration for {lobby_id} after "
+                         f"{UNDESCRIBED_GAME_TTL}s; dropping (host not streaming?)")
                 to_remove.append(lobby_id)
 
         for lobby_id in to_remove:
