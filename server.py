@@ -9,12 +9,14 @@ Aligned with the C++ LiveStreamer/LiveObserver client (libcurl websockets).
 import asyncio
 import json
 import os
+import secrets
 import struct
 import time
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import aiohttp
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 # ── Binary message types (aligned with C++ client) ────────────────────────
 MSG_REGISTER = 0
@@ -45,6 +47,26 @@ MAX_DELAY_SECONDS = 600
 
 # Verbose per-game / per-connection logging. Enable with DEBUG=1 (or "true"/"yes"/"on").
 DEBUG = os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+# ── Auth / access-control config (plans/go-auth-and-safeguards.md) ────────────
+# Both gates default OFF: this build ships the mechanism so it can be exercised directly
+# (curl the ticket endpoint, flip the env var in a test deployment) without yet requiring it,
+# because the GameClient side (a new ticket-fetch step before connecting) hasn't landed. Turning
+# REQUIRE_WATCH_AUTH on before that ships would lock out every current observer.
+REQUIRE_WATCH_AUTH = os.getenv("REQUIRE_WATCH_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_SELF_VIEW_BLOCK = os.getenv("ENABLE_SELF_VIEW_BLOCK", "").strip().lower() in ("1", "true", "yes", "on")
+
+GO_USERS_ME_URL = os.getenv(
+    "GO_USERS_ME_URL", "https://api.playgenerals.online/env/prod/contract/1/Users/Me")
+# Long enough to cover a real client's connect time (observed up to ~4s under a heavy
+# simultaneous-connect burst during load testing), short enough to keep the replay window for a
+# stolen ticket small.
+WATCH_TICKET_TTL_SECONDS = int(os.getenv("WATCH_TICKET_TTL_SECONDS", "30"))
+# What scheme/host the ticket's returned URL uses. Not derived from the request's own URL/Host
+# header, since those aren't trustworthy indicators of the public scheme until a reverse proxy
+# that sets X-Forwarded-Proto sits in front (see plans/relay-scaling-rework.md) — explicit
+# config avoids guessing wrong and handing out a URL the client can't actually connect to.
+PUBLIC_WS_SCHEME = os.getenv("PUBLIC_WS_SCHEME", "wss")
 
 
 def log_debug(*args) -> None:
@@ -175,6 +197,11 @@ class GameSession:
 
         self.sources: set[WebSocket] = set()
         self.observer_ws_set: set[WebSocket] = set()
+        # Self-view prevention (plans/go-auth-and-safeguards.md Phase 2): every IP that has
+        # registered as a source for this session. IP-based, not account-based — the streamer's
+        # own machine is the only IP the relay can attribute with confidence; a shared
+        # household/NAT false-positive is an accepted tradeoff, see that plan.
+        self.source_ips: set[str] = set()
 
         self._lock = asyncio.Lock()
         self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
@@ -395,16 +422,27 @@ class GameSession:
         """
         frame = pack_frame(msg_type, payload)
         dead: list[WebSocket] = []
-        for ws in (targets if targets is not None else list(self.observer_ws_set)):
+
+        async def send_one(ws: WebSocket) -> None:
             lock = self._observer_send_locks.get(ws)
             if lock is None:
-                continue    # already removed, or never fully registered
+                return    # already removed, or never fully registered
             try:
                 async with lock:
                     await ws.send_bytes(frame)
             except Exception as e:
                 log_warn(f"[OBSERVER] [WARN] send to observer failed ({type(e).__name__}: {e}), marking dead")
                 dead.append(ws)
+
+        # Concurrent, not sequential: a single slow/laggy observer must not delay delivery to
+        # every other observer of this game. Previously this was a plain `for` loop awaiting
+        # each send in turn, which measured as multi-second tail latency once a game had more
+        # than ~50-150 concurrent observers (see plans/relay-scaling-rework.md, "Load test
+        # findings"). `dead.append` from concurrent tasks is safe without a lock: asyncio tasks
+        # are cooperatively scheduled on one thread, so list.append can't interleave.
+        await asyncio.gather(*(send_one(ws) for ws in
+                                (targets if targets is not None else list(self.observer_ws_set))))
+
         for ws in dead:
             async with self._lock:
                 self.observer_ws_set.discard(ws)
@@ -414,6 +452,43 @@ class GameSession:
 
 # ── In-memory state ────────────────────────────────────────────────────────
 games: dict[str, GameSession] = {}
+
+# Watch tickets (plans/go-auth-and-safeguards.md Phase 1b): key -> {user_id, lobby_id,
+# expires_at}. In-process for now — becomes a Redis entry once the dispatcher tier in
+# plans/relay-scaling-rework.md exists and needs the same lookup shared across processes.
+watch_tickets: dict[str, dict] = {}
+
+# Created once at startup, reused for every Users/Me call — avoids paying TLS/TCP setup cost
+# per ticket mint. See start_cleanup_task/shutdown below.
+http_client: Optional[aiohttp.ClientSession] = None
+
+
+def mint_watch_ticket(lobby_id: str, user_id) -> dict:
+    """Create a single-use ticket admitting one /watch connection to this lobby."""
+    key = secrets.token_urlsafe(24)
+    watch_tickets[key] = {
+        "user_id": user_id,
+        "lobby_id": lobby_id,
+        "expires_at": time.time() + WATCH_TICKET_TTL_SECONDS,
+    }
+    return {"key": key, "expires_in": WATCH_TICKET_TTL_SECONDS}
+
+
+def consume_watch_ticket(key: Optional[str], lobby_id: str) -> Optional[dict]:
+    """Validate and burn a ticket. Returns the ticket dict on success, else None.
+
+    Pops unconditionally (even on a lobby_id mismatch) so a ticket is single-use regardless of
+    which check fails it — a client can't retry a stolen/mismatched ticket against a different
+    lobby_id after a first failed attempt.
+    """
+    if not key:
+        return None
+    ticket = watch_tickets.pop(key, None)
+    if ticket is None:
+        return None
+    if ticket["lobby_id"] != lobby_id or ticket["expires_at"] < time.time():
+        return None
+    return ticket
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -455,6 +530,100 @@ async def debug_body(
         "data_hex": result_slice.hex()[:1000],
         "data_preview": repr(result_slice[:200]),
     }
+
+
+@app.get("/watch/{lobby_id}/ticket")
+async def mint_ticket(lobby_id: str, request: Request):
+    """Mint a short-lived, single-use ticket admitting one /watch/{lobby_id} connection.
+
+    plans/go-auth-and-safeguards.md Phase 1b. Always performs full validation regardless of
+    REQUIRE_WATCH_AUTH — that flag only controls whether /watch *requires* a valid ticket, so
+    this endpoint is safe to exercise (and its failure paths safe to test) before the
+    GameClient-side ticket-fetch step exists. GO cannot be validated locally: session tokens are
+    signed with a symmetric key the relay does not and should not hold (see that plan's
+    "Confirmed facts (GO services backend)"), so this always costs one real network round-trip.
+    """
+    session = games.get(lobby_id)
+    if not session or session.ended:
+        raise HTTPException(status_code=404, detail="game not found or ended")
+
+    # Forwarded via header, never the URL/query string, and only over HTTPS (GO_USERS_ME_URL
+    # defaults to https:// — a misconfigured http:// override is caught below rather than
+    # silently sending the token in the clear). Never logged: no log line in this function (or
+    # anywhere else in the file) includes auth_header or any part of it.
+    if not GO_USERS_ME_URL.startswith("https://"):
+        log_warn(f"[TICKET] GO_USERS_ME_URL is not https:// ({GO_USERS_ME_URL!r}) — "
+                  f"the session token would be sent unencrypted; refusing")
+        raise HTTPException(status_code=500, detail="auth endpoint misconfigured")
+
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="missing Authorization header")
+
+    assert http_client is not None
+    try:
+        async with http_client.get(
+            GO_USERS_ME_URL,
+            headers={"Authorization": auth_header},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            # Forwarded faithfully rather than collapsed to a single pass/fail, so a future
+            # GameClient build can show the user something more specific than "try again":
+            #   200 -> valid JWT, user found                    -> proceed
+            #   401 -> invalid/expired JWT (GO's JWT middleware rejects before the controller
+            #          body runs, so this is the *only* code the live endpoint currently
+            #          returns for a bad token)
+            #   403 -> valid JWT, but the account is banned/unauthorized
+            #   404 -> valid JWT, but the account no longer exists (deleted user)
+            # 403/404 are not emitted by the Users/Me controller as it exists today (checked
+            # directly against the public source, GenOnlineService/Controllers/User/UserController.cs
+            # — MyUser() has no branch for either case, only the JWT-bearer middleware's 401)
+            # — handled here defensively so the relay needs no further change if/when GO adds
+            # that distinction upstream. Until then only 200/401 will actually occur.
+            if resp.status == 200:
+                user_data = await resp.json()
+            elif resp.status == 401:
+                raise HTTPException(status_code=401, detail="invalid or expired session token")
+            elif resp.status == 403:
+                raise HTTPException(status_code=403, detail="account banned or unauthorized")
+            elif resp.status == 404:
+                raise HTTPException(status_code=404, detail="account no longer exists")
+            else:
+                log_warn(f"[TICKET] unexpected Users/Me status {resp.status}")
+                raise HTTPException(status_code=502, detail="unexpected auth service response")
+    except aiohttp.ClientError as e:
+        log_warn(f"[TICKET] Users/Me call failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=503, detail="auth service unavailable")
+
+    # user_id is the identity signal, not display_name — an empty display_name can come from a
+    # DB error on GO's side while Users/Me still returns 200, so it must never be treated as
+    # "invalid user" here. This code never branches on display_name at all, by design.
+    #
+    # The 200 body itself is still validated: the real response (confirmed against the public
+    # controller source) is {"user_id": <Int64>, "display_name": <str>}, but a body that isn't
+    # an object with an integer user_id — a camelCased key rename, a list, a proxy serving a
+    # 200 error page, user_id arriving as string/bool — means the contract changed, and minting
+    # a ticket with user_id=None would silently poison every downstream consumer of the
+    # identity. Fail loudly instead; the ticket-mint call costs a real network round-trip
+    # anyway, so a degraded upstream is worth surfacing as a 502 rather than papering over.
+    if not isinstance(user_data, dict):
+        log_warn(f"[TICKET] Users/Me 200 body was not a JSON object: {type(user_data).__name__}")
+        raise HTTPException(status_code=502, detail="auth service returned an unexpected response")
+    user_id = user_data.get("user_id")
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        log_warn(f"[TICKET] Users/Me 200 body missing integer user_id: {user_data!r}")
+        raise HTTPException(status_code=502, detail="auth service returned an unexpected response")
+
+    if ENABLE_SELF_VIEW_BLOCK:
+        requester_ip = request.client.host if request.client else None
+        if requester_ip and requester_ip in session.source_ips:
+            raise HTTPException(status_code=403, detail="cannot watch your own stream")
+
+    ticket = mint_watch_ticket(lobby_id, user_id)
+    host = request.headers.get("host") or request.url.hostname
+    url = f"{PUBLIC_WS_SCHEME}://{host}/watch/{lobby_id}?ticket={ticket['key']}"
+    log_debug(f"[TICKET] minted for user_id={user_id} lobby={lobby_id}, expires_in={ticket['expires_in']}s")
+    return {"url": url, "expires_in": ticket["expires_in"]}
 
 
 @app.get("/games")
@@ -602,8 +771,11 @@ async def register_endpoint(websocket: WebSocket):
 
         if can_stream:
             role = "streamer"
+            client_ip = websocket.client.host if websocket.client else None
             async with session._lock:
                 session.sources.add(websocket)
+                if client_ip:
+                    session.source_ips.add(client_ip)
         else:
             role = "observer"
 
@@ -673,6 +845,29 @@ async def _keep_alive(ws: WebSocket) -> None:
 # WebSocket /watch/{lobby_id} (observers)
 # ═══════════════════════════════════════════════════════════════════════════
 
+async def admit_observer(websocket: WebSocket, session: GameSession, lobby_id: str) -> bool:
+    """Ticket + self-view checks shared by /watch and /watch-reconnect.
+
+    Sends the appropriate MSG_ERROR and closes on rejection. Returns True iff the caller should
+    proceed to session.add_observer().
+    """
+    if REQUIRE_WATCH_AUTH:
+        ticket_key = websocket.query_params.get("ticket")
+        if consume_watch_ticket(ticket_key, lobby_id) is None:
+            await websocket.send_bytes(pack_frame(MSG_ERROR, b"Missing or invalid watch ticket"))
+            await websocket.close()
+            return False
+
+    if ENABLE_SELF_VIEW_BLOCK:
+        observer_ip = websocket.client.host if websocket.client else None
+        if observer_ip and observer_ip in session.source_ips:
+            await websocket.send_bytes(pack_frame(MSG_ERROR, b"Cannot watch your own stream"))
+            await websocket.close()
+            return False
+
+    return True
+
+
 @app.websocket("/watch/{lobby_id}")
 async def watch_game(websocket: WebSocket, lobby_id: str):
     """
@@ -688,6 +883,9 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
     if not session or session.ended:
         await websocket.send_bytes(pack_frame(MSG_ERROR, b"Game not found or ended"))
         await websocket.close()
+        return
+
+    if not await admit_observer(websocket, session, lobby_id):
         return
 
     send_lock = await session.add_observer(websocket)
@@ -739,6 +937,9 @@ async def watch_reconnect(websocket: WebSocket, lobby_id: str):
         await websocket.close()
         return
 
+    if not await admit_observer(websocket, session, lobby_id):
+        return
+
     try:
         raw = await websocket.receive_text()
         msg = json.loads(raw)
@@ -787,14 +988,27 @@ async def watch_reconnect(websocket: WebSocket, lobby_id: str):
 
 @app.on_event("startup")
 async def start_cleanup_task():
+    global http_client
+    http_client = aiohttp.ClientSession()
     asyncio.create_task(_cleanup_loop())
 
 
+@app.on_event("shutdown")
+async def stop_http_client():
+    if http_client is not None:
+        await http_client.close()
+
+
 async def _cleanup_loop():
-    """Periodically remove ended, inactive, or never-described games."""
+    """Periodically remove ended, inactive, or never-described games; purge expired tickets."""
     while True:
         await asyncio.sleep(15)
         now = time.time()
+
+        expired_tickets = [k for k, t in watch_tickets.items() if t["expires_at"] < now]
+        for k in expired_tickets:
+            watch_tickets.pop(k, None)
+
         to_remove = []
         for lobby_id, session in games.items():
             if session.ended or (now - session.last_active > INACTIVE_GAME_TTL):

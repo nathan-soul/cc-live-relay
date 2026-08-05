@@ -522,6 +522,93 @@ async def test_host_authority():
             await asyncio.sleep(0.2)
 
 
+async def test_watch_ticket_missing_auth_header():
+    print("\n=== /watch/{lobby_id}/ticket: missing Authorization header ===")
+    import aiohttp
+    async with websockets.connect(f"{BASE}/register") as sws:
+        await sws.send(pack_frame(MSG_REGISTER, json.dumps({
+            "lobbyid": "test_game_009",
+            "player_name": "TicketTestHost",
+            "can_stream": True,
+            "is_host": True,
+        }).encode()))
+        raw = await sws.recv()
+        assert unpack_frame(raw)[0] == MSG_ROLE
+
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{HTTP}/watch/test_game_009/ticket") as r:
+                assert r.status == 401, f"expected 401, got {r.status}"
+                ok("ticket request with no Authorization header -> 401")
+
+        await sws.send(pack_frame(MSG_END, b""))
+        await asyncio.sleep(0.2)
+
+
+async def test_watch_ticket_unknown_lobby():
+    print("\n=== /watch/{lobby_id}/ticket: unknown lobby ===")
+    import aiohttp
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{HTTP}/watch/no_such_lobby_xyz/ticket",
+                          headers={"Authorization": "Bearer whatever"}) as r:
+            assert r.status == 404, f"expected 404, got {r.status}"
+            ok("ticket request for unknown lobby -> 404 (checked before any GO call)")
+
+
+async def test_watch_ticket_invalid_token():
+    print("\n=== /watch/{lobby_id}/ticket: invalid session token rejected by GO ===")
+    import aiohttp
+    async with websockets.connect(f"{BASE}/register") as sws:
+        await sws.send(pack_frame(MSG_REGISTER, json.dumps({
+            "lobbyid": "test_game_010",
+            "player_name": "TicketTestHost2",
+            "can_stream": True,
+            "is_host": True,
+        }).encode()))
+        raw = await sws.recv()
+        assert unpack_frame(raw)[0] == MSG_ROLE
+
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{HTTP}/watch/test_game_010/ticket",
+                              headers={"Authorization": "Bearer definitely-not-a-real-token"}) as r:
+                # Requires network access to api.playgenerals.online; treat a connectivity
+                # failure (503, "auth service unavailable") as inconclusive rather than a
+                # failed assertion, since it isn't what this test is checking.
+                if r.status == 503:
+                    print("  [SKIP] auth service unreachable from this environment")
+                else:
+                    assert r.status == 401, f"expected 401, got {r.status}"
+                    ok("ticket request with a garbage token -> 401 (rejected by GO's Users/Me)")
+
+        await sws.send(pack_frame(MSG_END, b""))
+        await asyncio.sleep(0.2)
+
+
+async def test_watch_without_ticket_when_auth_not_required():
+    print("\n=== /watch works without a ticket when REQUIRE_WATCH_AUTH is off (default) ===")
+    # Regression check: the new ticket machinery must be fully inert by default so existing
+    # (unmodified) GameClient builds keep working until the client-side ticket fetch ships.
+    async with websockets.connect(f"{BASE}/register") as sws:
+        await sws.send(pack_frame(MSG_REGISTER, json.dumps({
+            "lobbyid": "test_game_011",
+            "player_name": "NoTicketHost",
+            "can_stream": True,
+            "is_host": True,
+        }).encode()))
+        raw = await sws.recv()
+        assert unpack_frame(raw)[0] == MSG_ROLE
+        await sws.send(pack_frame(MSG_HEADER, b"NO_TICKET_HEADER"))
+        await asyncio.sleep(0.2)
+
+        async with websockets.connect(f"{BASE}/watch/test_game_011") as ows:
+            raw = await asyncio.wait_for(ows.recv(), timeout=2.0)
+            t, pl = unpack_frame(raw)
+            assert t == MSG_HEADER, f"expected HEADER without any ticket, got type={t}"
+            ok("observer admitted with no ticket param when REQUIRE_WATCH_AUTH is off")
+
+        await sws.send(pack_frame(MSG_END, b""))
+        await asyncio.sleep(0.2)
+
+
 async def test_register_error_missing_hash():
     print("\n=== Register error: missing lobbyid ===")
     async with websockets.connect(f"{BASE}/register") as ws:
@@ -561,6 +648,10 @@ async def main():
         test_reconnect_with_offset,
         test_debug_body,
         test_host_authority,
+        test_watch_ticket_missing_auth_header,
+        test_watch_ticket_unknown_lobby,
+        test_watch_ticket_invalid_token,
+        test_watch_without_ticket_when_auth_not_required,
         test_register_error_missing_hash,
     ]
 

@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Needed by test_relay_auth_mock.py (fastapi.testclient.TestClient, in-process ASGI testing —
+# no real sockets, no dependency on the real GO services).
+httpx

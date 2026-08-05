@@ -59,6 +59,11 @@ Via environment variables:
 | `RELAY_PORT` | `8765` | Listen port |
 | `DEBUG` | off | Set to `1`/`true`/`yes`/`on` for verbose per-game/per-connection logging |
 | `UNDESCRIBED_GAME_TTL` | `120` | Seconds a session may run before the host describes it, after which it is dropped |
+| `REQUIRE_WATCH_AUTH` | off | Require a valid `?ticket=` (see below) to connect to `/watch` or `/watch-reconnect`. Off by default — leave off until the GameClient side (fetch a ticket before connecting) has shipped, or every current observer is locked out |
+| `ENABLE_SELF_VIEW_BLOCK` | off | Reject an observer connecting from the same IP as a registered source for that game (self-view prevention). Off by default — a same-machine streamer+observer test setup would otherwise reject itself |
+| `GO_USERS_ME_URL` | `https://api.playgenerals.online/env/prod/contract/1/Users/Me` | GeneralsOnline endpoint used to validate a session token when minting a watch ticket |
+| `WATCH_TICKET_TTL_SECONDS` | `30` | How long a minted watch ticket stays valid/unused before it expires |
+| `PUBLIC_WS_SCHEME` | `wss` | Scheme used when building the ticket response's connect URL |
 
 ## Starting
 
@@ -94,9 +99,32 @@ the same host/port, only differing by path.
 | `GET /health` | HTTP | Health check |
 | `GET /games` | HTTP | Active games the host has described (see above) |
 | `GET /debug/body/{lobbyid}` | HTTP | Inspect raw body bytes (debugging) |
+| `GET /watch/{lobbyid}/ticket` | HTTP | Mint a short-lived, single-use watch ticket. Requires `Authorization: Bearer <session_token>`; validated against GO's `Users/Me`. Returns `{"url", "expires_in"}` |
 | `WS /register` | WebSocket | Client registers with a binary REGISTER frame carrying `lobbyid`, `can_stream` and `is_host`; becomes a streamer or observer based on `can_stream` — streamers send HEADER/PATCH/BODY/END frames over this connection |
-| `WS /watch/{lobbyid}` | WebSocket | Observer watches a game (catch-up + live stream) |
-| `WS /watch-reconnect/{lobbyid}` | WebSocket | Observer reconnects with a `last_offset` hint |
+| `WS /watch/{lobbyid}` | WebSocket | Observer watches a game (catch-up + live stream). Accepts `?ticket=<key>` from the ticket endpoint above; only required when `REQUIRE_WATCH_AUTH` is on |
+| `WS /watch-reconnect/{lobbyid}` | WebSocket | Observer reconnects with a `last_offset` hint. Same `?ticket=` handling as `/watch` |
+
+### Auth (opt-in, off by default)
+
+See `plans/go-auth-and-safeguards.md` for the full design. Summary: a client fetches a ticket
+over plain HTTP (proving GO login via a real `Users/Me` round-trip) before ever opening the
+`/watch` WebSocket, so the slow part of validation never sits on the WebSocket accept path. Both
+`REQUIRE_WATCH_AUTH` and `ENABLE_SELF_VIEW_BLOCK` default off so this ships inertly ahead of the
+GameClient-side ticket-fetch step — flip them on only once that lands.
+
+## Testing
+
+```bash
+pip install -r requirements-dev.txt
+
+# Integration tests against a live server (needs RELAY_TEST_PORT/localhost reachable):
+python test_relay.py
+
+# Watch-ticket auth + self-view block flows, fully mocked (no real GO services call, no real
+# sockets — safe to run anywhere, doesn't need REQUIRE_WATCH_AUTH / ENABLE_SELF_VIEW_BLOCK set
+# beforehand):
+python test_relay_auth_mock.py
+```
 
 ## Development
 

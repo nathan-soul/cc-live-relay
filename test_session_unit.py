@@ -141,8 +141,20 @@ async def test_games_payload():
     """/games must carry what the in-game observer browser renders."""
     print("\ntest_games_payload")
     session = new_session()
-    session.map_name = "Tournament Desert"
-    session.players = ["Dennis", "Opponent"]
+    session.lobby = {
+        "lobbytype": 0,
+        "region": "USWest",
+        "rngseed": 1234,
+        "mapname": "Tournament Desert",
+        "mappath": "",
+        "name": "Dennis's Game",
+        "owner": 1,
+        "members": [
+            {"userid": 1, "displayname": "Dennis"},
+            {"userid": 2, "displayname": "Opponent"},
+            {"userid": -1, "displayname": ""},
+        ],
+    }
 
     saved = dict(server.games)
     server.games.clear()
@@ -155,10 +167,13 @@ async def test_games_payload():
 
     check("one row returned", len(rows) == 1, f"rows={rows}")
     row = rows[0]
-    for key in ("game_id", "map", "players", "viewers", "delay_seconds", "age_seconds"):
+    for key in ("lobbyid", "mapname", "name", "members", "viewers", "sources",
+                "delay_seconds", "age_seconds"):
         check(f"row has {key}", key in row, f"row={row}")
-    check("map populated", row.get("map") == "Tournament Desert", f"row={row}")
-    check("players populated", row.get("players") == ["Dennis", "Opponent"], f"row={row}")
+    check("lobbyid populated", row.get("lobbyid") == "unittest", f"row={row}")
+    check("map populated", row.get("mapname") == "Tournament Desert", f"row={row}")
+    occupied = [m.get("displayname") for m in row.get("members", []) if m.get("userid", -1) != -1]
+    check("players populated", occupied == ["Dennis", "Opponent"], f"row={row}")
     check("delay forwarded", row.get("delay_seconds") == DELAY_SECONDS, f"row={row}")
     check("age is a non-negative int",
           isinstance(row.get("age_seconds"), int) and row["age_seconds"] >= 0, f"row={row}")
