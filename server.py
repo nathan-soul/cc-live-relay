@@ -11,6 +11,7 @@ import json
 import os
 import struct
 import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -82,16 +83,82 @@ def unpack_frame(data: bytes) -> tuple:
     return (msg_type, data[5:5 + payload_len])
 
 
+# ── GO-shaped lobby metadata ───────────────────────────────────────────────
+#
+# The client sends the descriptive half of its GeneralsOnline lobby verbatim under "lobby" in
+# REGISTER, using GO's own key spelling, and the relay republishes it in /games. A client
+# therefore parses the same structure whether the game list came from here or, one day, from GO
+# itself — no translation layer on either side.
+#
+# The allow-lists are the point of this, not a formality: a GO lobby also carries a password,
+# per-member ports and an anticheat id, none of which are a third-party viewer's business. Only
+# these keys survive into a session, so the relay can never become an accidental republisher of
+# something a client should not have sent in the first place.
+LOBBY_KEYS = ("lobbytype", "region", "rngseed", "mapname", "mappath", "name", "owner")
+LOBBY_MEMBER_KEYS = ("userid", "displayname")
+
+# Defaults, so every /games row has the full key set even when the streamer sent no lobby block
+# (an older client, or one that started a match without a lobby cache). Empty rather than absent
+# keeps the client's parsing free of per-key existence checks.
+LOBBY_DEFAULTS = {
+    "lobbytype": -1,
+    "region": "",
+    "rngseed": -1,
+    "mapname": "",
+    "mappath": "",
+    "name": "",
+    "owner": -1,
+    "members": [],
+}
+
+
+def sanitize_lobby(raw) -> dict:
+    """Reduce a client-sent lobby block to the allow-listed keys. Never raises."""
+    if not isinstance(raw, dict):
+        return {}
+    lobby = {k: raw[k] for k in LOBBY_KEYS if k in raw}
+    members = []
+    raw_members = raw.get("members")
+    if isinstance(raw_members, list):
+        for member in raw_members:
+            if isinstance(member, dict):
+                members.append({k: member[k] for k in LOBBY_MEMBER_KEYS if k in member})
+    lobby["members"] = members
+    return lobby
+
+
+def lobby_player_names(lobby: dict) -> list:
+    """Display names of the occupied slots only.
+
+    members[] mirrors GO exactly, which means it includes the empty slots (userid -1, blank
+    display name) that pad a lobby out to its maximum size. Those are meaningless in a
+    "who is playing" list, so they are dropped here rather than at the transport.
+    """
+    names = []
+    for member in lobby.get("members") or []:
+        if not isinstance(member, dict):
+            continue
+        if member.get("userid", -1) == -1:
+            continue
+        name = member.get("displayname", "")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
 # ── GameSession ────────────────────────────────────────────────────────────
 
 class GameSession:
     """One active game: multiple sources, multiple observers."""
 
-    def __init__(self, game_hash: str):
-        self.game_id: str = game_hash
-        self.game_hash: str = game_hash
-        self.map_name: str = ""
-        self.players: list = []
+    def __init__(self, lobby_id: str):
+        # GO's LobbyID as decimal text. The relay's session key, the id an observer watches
+        # by, and the same value GO itself publishes — one id, and one name for it.
+        self.lobby_id: str = lobby_id
+        # GO-shaped lobby block, first registrant wins (see sanitize_lobby). The single
+        # source of descriptive truth for this session — deliberately not unpacked into
+        # separate map/player fields, so there is nothing to keep in step with it.
+        self.lobby: dict = {}
         self.created_at: float = time.time()
         self.last_active: float = time.time()
         self.delay_seconds: int = DEFAULT_DELAY_SECONDS
@@ -120,9 +187,9 @@ class GameSession:
                 self.header_received = True
                 self.last_active = time.time()
                 should_broadcast = True
-                log_debug(f"[LIVESTREAMER] [HEADER] Game {self.game_hash[:12]}: stored header ({len(payload)} bytes)")
+                log_debug(f"[LIVESTREAMER] [HEADER] Game {self.lobby_id}: stored header ({len(payload)} bytes)")
             elif bytes(self.header) != payload:
-                log_warn(f"[LIVESTREAMER] [WARN] HEADER mismatch from another source for game {self.game_hash[:12]}: "
+                log_warn(f"[LIVESTREAMER] [WARN] HEADER mismatch from another source for game {self.lobby_id}: "
                       f"stored={len(self.header)}B, received={len(payload)}B")
         if should_broadcast:
             await self._broadcast_envelope(MSG_HEADER, payload)
@@ -142,7 +209,7 @@ class GameSession:
                 self.header.extend(b'\x00' * (needed - len(self.header)))
             self.header[offset:offset + patch_len] = patch_data
             self.last_active = time.time()
-            log_debug(f"[LIVESTREAMER] [PATCH] Game {self.game_hash[:12]}: offset={offset} len={patch_len} header_size={len(self.header)}")
+            log_debug(f"[LIVESTREAMER] [PATCH] Game {self.lobby_id}: offset={offset} len={patch_len} header_size={len(self.header)}")
         await self._broadcast_envelope(MSG_PATCH, payload)
 
     async def apply_body(self, ws: WebSocket, payload: bytes) -> None:
@@ -169,15 +236,15 @@ class GameSession:
                 # would duplicate it.
                 targets = list(self.observer_ws_set)
                 if len(self.body) < 5000 or len(self.body) % 50000 == 0:
-                    log_debug(f"[LIVESTREAMER] [BODY] Game {self.game_hash[:12]}: +{len(data)}B @ offset={offset} total={len(self.body)}")
+                    log_debug(f"[LIVESTREAMER] [BODY] Game {self.lobby_id}: +{len(data)}B @ offset={offset} total={len(self.body)}")
             elif offset < body_len:
                 overlap = min(len(data), body_len - offset)
                 existing = bytes(self.body[offset:offset + overlap])
                 if data[:overlap] != existing:
-                    log_warn(f"[LIVESTREAMER] [WARN] BODY desync for game {self.game_hash[:12]}: "
+                    log_warn(f"[LIVESTREAMER] [WARN] BODY desync for game {self.lobby_id}: "
                           f"offset={offset} overlap={overlap} mismatch!")
             else:
-                log_warn(f"[LIVESTREAMER] [ERROR] BODY gap for game {self.game_hash[:12]}: "
+                log_warn(f"[LIVESTREAMER] [ERROR] BODY gap for game {self.lobby_id}: "
                       f"offset={offset} > body_len={body_len} — dropping, investigate source")
 
         if should_broadcast:
@@ -190,7 +257,7 @@ class GameSession:
         if not self.header:
             return
         os.makedirs("replays", exist_ok=True)
-        filename = f"replays/{self.game_hash}.rep"
+        filename = f"replays/{self.lobby_id}.rep"
         with open(filename, "wb") as f:
             f.write(bytes(self.header))
             f.write(bytes(self.body))
@@ -208,14 +275,14 @@ class GameSession:
                 self.ended = True
                 should_broadcast_end = True
                 should_save = True
-                log_debug(f"[LIVESTREAMER] [END] Game {self.game_hash[:12]}: all sources gone, END was received")
+                log_debug(f"[LIVESTREAMER] [END] Game {self.lobby_id}: all sources gone, END was received")
             elif not self.sources:
                 self.ended = True
                 should_save = True
-                log_debug(f"[LIVESTREAMER] [SOURCE_GONE] Game {self.game_hash[:12]}: last source disconnected"
+                log_debug(f"[LIVESTREAMER] [SOURCE_GONE] Game {self.lobby_id}: last source disconnected"
                       f" ({len(self.sources)} remaining)")
             else:
-                log_debug(f"[LIVESTREAMER] [SOURCE_GONE] source disconnected from game {self.game_hash[:12]}... "
+                log_debug(f"[LIVESTREAMER] [SOURCE_GONE] source disconnected from game {self.lobby_id}... "
                       f"({len(self.sources)} remaining)")
         if should_save:
             self.save_replay()
@@ -292,7 +359,7 @@ class GameSession:
         # Must precede the HEADER: receiving the header is what starts playback on the
         # observer, and the pre-roll buffer latches against the delay — a value that
         # arrived afterwards would be too late to take effect for this session.
-        config_json = json.dumps({"role": "observer", "game_id": self.game_id,
+        config_json = json.dumps({"role": "observer", "lobbyid": self.lobby_id,
             "delay_seconds": delay_snapshot}, separators=(',', ':'))
         await ws.send_bytes(pack_frame(MSG_ROLE, config_json.encode()))
 
@@ -361,14 +428,14 @@ async def health():
     }
 
 
-@app.get("/debug/body/{game_id}")
+@app.get("/debug/body/{lobby_id}")
 async def debug_body(
-    game_id: str,
+    lobby_id: str,
     offset: int = 0,
     limit: int = 200,
 ):
     """Inspect raw body bytes for a game (hex preview, for debugging)."""
-    session = games.get(game_id)
+    session = games.get(lobby_id)
     if not session:
         return {"error": "game not found"}
     body = bytes(session.body)
@@ -376,7 +443,7 @@ async def debug_body(
     if limit > 0:
         result_slice = result_slice[:limit]
     return {
-        "game_id": session.game_id,
+        "lobbyid": session.lobby_id,
         "body_bytes": len(body),
         "header_bytes": len(session.header),
         "offset": offset,
@@ -388,25 +455,40 @@ async def debug_body(
 
 @app.get("/games")
 async def list_games():
-    """Live games available to watch. Backs the in-game observer browser."""
+    """Live games available to watch. Backs the in-game observer browser.
+
+    Each row is GeneralsOnline's own lobby shape (LOBBY_KEYS + members, flat, GO's key
+    spelling) with the relay's per-session fields alongside it. Keeping the descriptive
+    half identical to GO means the client's row-parsing code does not care which service
+    produced the list.
+    """
     now = time.time()
     result = []
     for g in games.values():
-        if not g.ended:
-            result.append({
-                "game_id": g.game_id,
-                "map": g.map_name,
-                "players": g.players,
-                "viewers": len(g.observer_ws_set),
-                "body_bytes": len(g.body),
-                "sources": len(g.sources),
-                # The observer applies this delay, so showing it up front sets the
-                # expectation of how far behind live the view will be.
-                "delay_seconds": g.delay_seconds,
-                # How long this game has been streaming. Joining a long-running game
-                # means starting well behind live, which is worth seeing before you commit.
-                "age_seconds": int(now - g.created_at),
-            })
+        if g.ended:
+            continue
+
+        entry = dict(LOBBY_DEFAULTS)
+        entry.update(g.lobby)
+        entry.update({
+            "lobbyid": g.lobby_id,
+            # GO reports the lobby's own creation time; the relay only ever sees a game at
+            # REGISTER, so this is when THIS SESSION started, which is also what
+            # age_seconds counts from. Same field name and ISO-8601 UTC format as GO so a
+            # shared parser works, but do not read it as the lobby's creation time.
+            "timecreated": datetime.fromtimestamp(g.created_at, timezone.utc)
+                                   .isoformat().replace("+00:00", "Z"),
+            "viewers": len(g.observer_ws_set),
+            "body_bytes": len(g.body),
+            "sources": len(g.sources),
+            # The observer applies this delay, so showing it up front sets the
+            # expectation of how far behind live the view will be.
+            "delay_seconds": g.delay_seconds,
+            # How long this game has been streaming. Joining a long-running game
+            # means starting well behind live, which is worth seeing before you commit.
+            "age_seconds": int(now - g.created_at),
+        })
+        result.append(entry)
     return result
 
 
@@ -421,8 +503,8 @@ async def register_endpoint(websocket: WebSocket):
     No more streamer/backup distinction — everyone sends continuously.
 
     Protocol (binary):
-    1. Client sends REGISTER frame (type=0), payload = JSON with game_hash/can_stream/player_name
-    2. Server sends ROLE frame (type=5), payload = JSON {"role":"streamer","game_id":"..."}
+    1. Client sends REGISTER frame (type=0), payload = JSON with lobbyid/can_stream/player_name
+    2. Server sends ROLE frame (type=5), payload = JSON {"role":"streamer","lobbyid":"..."}
     3. Source sends HEADER (type=1), then PATCH/BODY/END (type=2/3/4)
     """
     await websocket.accept()
@@ -447,54 +529,42 @@ async def register_endpoint(websocket: WebSocket):
 
         reg_text = payload.decode("utf-8", errors="replace")
         log_debug(f"[LIVESTREAMER] [REGISTER] received: {repr(reg_text[:200])}")
-        try:
-            reg = json.loads(reg_text)
-        except json.JSONDecodeError:
-            # Client may send unescaped backslashes in paths (e.g. Maps\ShellMapMD\...)
-            fixed = reg_text.replace('\\', '\\\\')
-            reg = json.loads(fixed)
+        # The client escapes its own JSON now (liveStreamJsonEscape), so a payload that does
+        # not parse is genuinely broken. This used to retry with every backslash doubled, to
+        # cope with raw Windows paths — a hack that a quote in a lobby name would have
+        # defeated anyway, and that could only corrupt a payload that was already valid.
+        reg = json.loads(reg_text)
 
-        game_hash = reg.get("game_hash", "")
+        lobby_id = reg.get("lobbyid", "")
         player_name = reg.get("player_name", "unknown")
         can_stream = reg.get("can_stream", False)
 
-        if not game_hash:
-            await websocket.send_bytes(pack_frame(MSG_ERROR, b"game_hash required"))
+        if not lobby_id:
+            await websocket.send_bytes(pack_frame(MSG_ERROR, b"lobbyid required"))
             await websocket.close()
             return
 
         # ── Assign session ─────────────────────────────────────────────
-        if game_hash in games:
-            session = games[game_hash]
+        if lobby_id in games:
+            session = games[lobby_id]
             if session.ended:
-                session = GameSession(game_hash)
-                games[game_hash] = session
+                session = GameSession(lobby_id)
+                games[lobby_id] = session
         else:
-            session = GameSession(game_hash)
-            games[game_hash] = session
+            session = GameSession(lobby_id)
+            games[lobby_id] = session
 
-        # Descriptive metadata for GET /games. REGISTER has always carried these; they
-        # were simply never stored, so the game list rendered blank Map and Players
-        # columns. Take them from any client, streamer or not — an observer-only client
-        # still knows the map, and whoever registers first populates it.
-        # m_mapName is a path like "Maps/Tournament Desert/Tournament Desert.map"; the
-        # browser wants something readable, and stripping it here keeps the client dumb.
-        map_name = reg.get("map_name", "")
-        if map_name and not session.map_name:
-            leaf = map_name.replace("\\", "/").rstrip("/").split("/")[-1]
-            if leaf.lower().endswith(".map"):
-                leaf = leaf[:-4]
-            session.map_name = leaf or map_name
-
-        # Prefer the full roster; fall back to the single local name that older clients
-        # send, so a mixed-version lobby still lists something.
-        roster = reg.get("players")
-        if isinstance(roster, list) and roster:
-            for name in roster:
-                if isinstance(name, str) and name and name not in session.players:
-                    session.players.append(name)
-        elif player_name and player_name not in session.players:
-            session.players.append(player_name)
+        # ── Descriptive metadata for GET /games ────────────────────────
+        # Take it from any client, streamer or not — an observer-only client still knows
+        # the lobby, and whoever registers first populates it. First-wins: every peer in
+        # the same lobby sends the same block, so later ones have nothing to add.
+        if not session.lobby:
+            lobby = sanitize_lobby(reg.get("lobby"))
+            if lobby:
+                session.lobby = lobby
+                log_debug(f"[LIVESTREAMER] [REGISTER] lobby '{lobby.get('name', '')}' on "
+                          f"'{lobby.get('mapname', '')}' "
+                          f"({len(lobby_player_names(lobby))} players) for {session.lobby_id}")
 
         if can_stream:
             role = "streamer"
@@ -504,7 +574,7 @@ async def register_endpoint(websocket: WebSocket):
             if raw_delay is not None:
                 try:
                     session.delay_seconds = max(0, min(int(raw_delay), MAX_DELAY_SECONDS))
-                    log_debug(f"[LIVESTREAMER] [DELAY] Game {session.game_hash[:12]}: "
+                    log_debug(f"[LIVESTREAMER] [DELAY] Game {session.lobby_id}: "
                           f"delay_seconds={session.delay_seconds}")
                 except (TypeError, ValueError):
                     log_warn(f"[LIVESTREAMER] [WARN] bad delay_seconds={raw_delay!r}, "
@@ -515,10 +585,10 @@ async def register_endpoint(websocket: WebSocket):
             role = "observer"
 
         # ── Send ROLE response (binary) ────────────────────────────────
-        role_json = json.dumps({"role": role, "game_id": session.game_id,
+        role_json = json.dumps({"role": role, "lobbyid": session.lobby_id,
             "body_offset": len(session.body)}, separators=(',', ':'))
         await websocket.send_bytes(pack_frame(MSG_ROLE, role_json.encode()))
-        log_debug(f"[LIVESTREAMER] [REGISTER] {player_name} -> role={role} game={session.game_hash[:12]}...")
+        log_debug(f"[LIVESTREAMER] [REGISTER] {player_name} -> role={role} game={session.lobby_id}...")
 
         # ── Enter loop ─────────────────────────────────────────────────
         if role == "streamer":
@@ -564,7 +634,7 @@ async def _source_loop(ws: WebSocket, session: GameSession) -> None:
         elif msg_type == MSG_END:
             async with session._lock:
                 session.end_received = True
-            log_debug(f"[LIVESTREAMER] [END] Source sent END for game {session.game_hash[:12]}")
+            log_debug(f"[LIVESTREAMER] [END] Source sent END for game {session.lobby_id}")
             break
 
 
@@ -577,11 +647,11 @@ async def _keep_alive(ws: WebSocket) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# WebSocket /watch/{game_id} (observers)
+# WebSocket /watch/{lobby_id} (observers)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.websocket("/watch/{game_id}")
-async def watch_game(websocket: WebSocket, game_id: str):
+@app.websocket("/watch/{lobby_id}")
+async def watch_game(websocket: WebSocket, lobby_id: str):
     """
     An observer connects to watch a game.
 
@@ -590,7 +660,7 @@ async def watch_game(websocket: WebSocket, game_id: str):
     2. Server streams live PATCH/BODY/END (type=2/3/4)
     """
     await websocket.accept()
-    session = games.get(game_id)
+    session = games.get(lobby_id)
 
     if not session or session.ended:
         await websocket.send_bytes(pack_frame(MSG_ERROR, b"Game not found or ended"))
@@ -603,7 +673,7 @@ async def watch_game(websocket: WebSocket, game_id: str):
         await websocket.close()
         return
 
-    log_debug(f"[OBSERVER] [WATCH] Observer connected to game {game_id[:12]}... ({len(session.observer_ws_set)} viewers)")
+    log_debug(f"[OBSERVER] [WATCH] Observer connected to game {lobby_id} ({len(session.observer_ws_set)} viewers)")
 
     try:
         # add_observer handed us the send lock already held, so live broadcasts queue
@@ -619,7 +689,7 @@ async def watch_game(websocket: WebSocket, game_id: str):
                 break
 
     except WebSocketDisconnect:
-        log_debug(f"[OBSERVER] [WATCH] Observer disconnected from game {game_id[:12]}")
+        log_debug(f"[OBSERVER] [WATCH] Observer disconnected from game {lobby_id}")
     except Exception as e:
         log_debug(f"[OBSERVER] [WATCH] Observer error: {e}")
     finally:
@@ -627,11 +697,11 @@ async def watch_game(websocket: WebSocket, game_id: str):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# WebSocket /watch-reconnect/{game_id}
+# WebSocket /watch-reconnect/{lobby_id}
 # ═══════════════════════════════════════════════════════════════════════════
 
-@app.websocket("/watch-reconnect/{game_id}")
-async def watch_reconnect(websocket: WebSocket, game_id: str):
+@app.websocket("/watch-reconnect/{lobby_id}")
+async def watch_reconnect(websocket: WebSocket, lobby_id: str):
     """
     Observer reconnects with a last_offset hint.
 
@@ -639,7 +709,7 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
     Server sends: HEADER + BODY[last_offset:] + live stream (binary).
     """
     await websocket.accept()
-    session = games.get(game_id)
+    session = games.get(lobby_id)
 
     if not session:
         await websocket.send_bytes(pack_frame(MSG_ERROR, b"Game not found"))
@@ -681,7 +751,7 @@ async def watch_reconnect(websocket: WebSocket, game_id: str):
                 break
 
     except WebSocketDisconnect:
-        log_debug(f"[OBSERVER] [RECONNECT] Observer disconnected from game {game_id[:12]}")
+        log_debug(f"[OBSERVER] [RECONNECT] Observer disconnected from game {lobby_id}")
     except Exception as e:
         log_debug(f"[OBSERVER] [RECONNECT] Observer error: {e}")
     finally:
@@ -703,18 +773,18 @@ async def _cleanup_loop():
         await asyncio.sleep(15)
         now = time.time()
         to_remove = []
-        for game_hash, session in games.items():
+        for lobby_id, session in games.items():
             if session.ended or (now - session.last_active > INACTIVE_GAME_TTL):
-                to_remove.append(game_hash)
+                to_remove.append(lobby_id)
 
-        for game_hash in to_remove:
-            session = games.pop(game_hash, None)
+        for lobby_id in to_remove:
+            session = games.pop(lobby_id, None)
             if session:
                 try:
                     await session._broadcast_envelope(MSG_END, b'')
                 except Exception:
                     pass
-                log_debug(f"[LIVESTREAMER] [CLEANUP] Removed game {game_hash[:12]}...")
+                log_debug(f"[LIVESTREAMER] [CLEANUP] Removed game {lobby_id}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
