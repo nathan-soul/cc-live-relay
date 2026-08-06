@@ -39,6 +39,21 @@ def live_session(lobby_id: str) -> GameSession:
     return session
 
 
+def reset_batch_state():
+    """Drop any timer and dirty state a previous test left behind.
+
+    The batch state is module-level and shared, so a still-pending timer from an earlier test
+    makes _arm_observer_batch a no-op for every later one -- which looks exactly like the code
+    under test failing to arm.
+    """
+    task = server._observer_batch_task
+    if task is not None:
+        task.cancel()
+    server._observer_batch_task = None
+    server._observer_dirty.clear()
+    server._ended_dirty.clear()
+
+
 def check(label: str, condition: bool, detail: str = ""):
     global PASS, FAIL
     if condition:
@@ -242,12 +257,90 @@ async def test_periodic_flush():
         patch("OBSERVER_UPDATE_INTERVAL", 60)
 
 
+async def test_stream_going_live_bypasses_the_batch():
+    """A stream becoming watchable is reported at once, not after the batch window."""
+    print("\ntest_stream_going_live_bypasses_the_batch")
+    patch("GO_OBSERVERS_URL", "http://go/observers")
+    patch("OBSERVER_CHANGE_TIMEOUT", 30)   # far longer than this test waits
+    sent = []
+    original = server.notify_lobby_progress
+
+    async def stub(entries):
+        sent.append(entries)
+        return True
+
+    server.notify_lobby_progress = stub
+    reset_batch_state()
+    try:
+        session = live_session("batch_live")
+
+        await server.report_stream_live("batch_live")
+        # No sleep: if this went through the shared timer there would be nothing here yet.
+        check("live report sent without waiting for the window",
+              sent == [[{"lobby_id": "batch_live", "observer_count": 0, "is_live": True}]],
+              f"sent={sent}")
+        check("not queued for the batch", "batch_live" not in server._observer_dirty)
+        check("count recorded as reported", session._last_reported_observers == 0)
+
+        # A session with no header is not watchable, so it is not live either -- the immediate
+        # path has to apply the same rule the batch does.
+        no_header = GameSession("batch_live_noheader")
+        server.games["batch_live_noheader"] = no_header
+        await server.report_stream_live("batch_live_noheader")
+        check("session without a header is not reported live", len(sent) == 1, f"sent={sent}")
+    finally:
+        server.notify_lobby_progress = original
+        server.games.pop("batch_live", None)
+        server.games.pop("batch_live_noheader", None)
+        server._observer_dirty.clear()
+        server._ended_dirty.clear()
+        patch("GO_OBSERVERS_URL", "")
+        patch("OBSERVER_CHANGE_TIMEOUT", 15)
+
+
+async def test_failed_live_report_falls_back_to_the_batch():
+    """When GO does not accept the immediate report, the lobby is retried via the batch."""
+    print("\ntest_failed_live_report_falls_back_to_the_batch")
+    patch("GO_OBSERVERS_URL", "http://go/observers")
+    patch("OBSERVER_CHANGE_TIMEOUT", 0.05)
+    attempts = []
+    original = server.notify_lobby_progress
+
+    async def stub(entries):
+        attempts.append(entries)
+        return len(attempts) > 1    # first call fails, the retry succeeds
+
+    server.notify_lobby_progress = stub
+    reset_batch_state()
+    try:
+        live_session("batch_live_retry")
+
+        await server.report_stream_live("batch_live_retry")
+        check("first attempt made", len(attempts) == 1, f"attempts={attempts}")
+        check("lobby left dirty for the batch", "batch_live_retry" in server._observer_dirty)
+
+        await asyncio.sleep(0.15)
+        check("batch retried it", len(attempts) == 2, f"attempts={attempts}")
+        check("retry reported it live",
+              attempts[-1] == [{"lobby_id": "batch_live_retry", "observer_count": 0, "is_live": True}],
+              f"attempts={attempts}")
+    finally:
+        server.notify_lobby_progress = original
+        server.games.pop("batch_live_retry", None)
+        server._observer_dirty.clear()
+        server._ended_dirty.clear()
+        patch("GO_OBSERVERS_URL", "")
+        patch("OBSERVER_CHANGE_TIMEOUT", 15)
+
+
 async def main():
     await test_batch_coalesces_multiple_lobbies()
     await test_timer_not_reset_by_mid_window_change()
     await test_unchanged_count_skipped()
     await test_ended_stream_sends_is_live_false()
     await test_periodic_flush()
+    await test_stream_going_live_bypasses_the_batch()
+    await test_failed_live_report_falls_back_to_the_batch()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

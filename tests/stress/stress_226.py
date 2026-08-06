@@ -16,6 +16,7 @@ Usage: python tests/stress/stress_226.py [--games 226] [--observers 250] [--marq
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import struct
 import time
@@ -23,10 +24,13 @@ import time
 import aiohttp
 import websockets
 
-GO = "http://localhost:8080"
-RELAY_WS = "ws://localhost:8765"
-RELAY_HTTP = "http://localhost:8765"
-RELAY_KEY = "test123"
+# Endpoints are overridable via env so the same script targets a local test stack
+# (defaults) or the batty deployment (e.g. GO=https://batty.youbantoo.club/go
+# RELAY_HTTP=https://batty.youbantoo.club/relay RELAY_KEY=<batty INTERNAL_API_KEY>).
+GO = os.getenv("GO", "http://localhost:8080")
+RELAY_WS = os.getenv("RELAY_WS", "ws://localhost:8765")
+RELAY_HTTP = os.getenv("RELAY_HTTP", "http://localhost:8765")
+RELAY_KEY = os.getenv("RELAY_KEY", "test123")
 
 MSG_REGISTER = 0
 MSG_HEADER = 1
@@ -316,7 +320,9 @@ async def main():
     print(f"[phase1] created {len(games)}/{args.games} INGAME lobbies")
 
     # ── Phase 2: streamer URLs ───────────────────────────────────────────
-    # game 0 = marquee (2 streamers: host + rival); others 1 streamer (host)
+    # One streamer per game (the host's token via GO /livestreams/register). The relay
+    # internal mint for a second "rival" streamer is skipped: it needs the batty
+    # INTERNAL_API_KEY (X-Relay-Key), which the local runs don't have.
     streamer_urls = []  # index aligns with games
     for gi, game in enumerate(games):
         urls = []
@@ -327,19 +333,11 @@ async def main():
             else:
                 metrics.reg_fail += 1
                 metrics.errors.append(f"register {game['lobby_id']}: {status} {reg.get('detail')}")
-            if gi == 0:  # marquee: rival also streams
-                rival = await login()
-                try:
-                    urls.append(await relay_internal_stream_token(game["lobby_id"], rival["user_id"]))
-                except Exception as e:
-                    metrics.reg_fail += 1
-                    metrics.errors.append(f"rival token: {type(e).__name__}: {e}")
         except Exception as e:
             metrics.reg_fail += 1
             metrics.errors.append(f"register loop: {type(e).__name__}: {e}")
         streamer_urls.append(urls)
-    print(f"[phase2] streamer urls: {sum(len(u) for u in streamer_urls)} total "
-          f"(marquee={len(streamer_urls[0]) if streamer_urls else 0})")
+    print(f"[phase2] streamer urls: {sum(len(u) for u in streamer_urls)} total")
 
     # ── Phase 3: connect streamers, push ─────────────────────────────────
     streamer_tasks = []

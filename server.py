@@ -52,6 +52,12 @@ UNDESCRIBED_GAME_TTL = int(os.getenv("UNDESCRIBED_GAME_TTL", "120"))
 DEFAULT_DELAY_SECONDS = int(os.getenv("DEFAULT_DELAY_SECONDS", "15"))
 MAX_DELAY_SECONDS = 600
 
+# Max concurrent per-chunk observer sends in _broadcast_envelope. At scale (many games x many
+# observers) an unbounded per-observer task per BODY chunk creates tens of thousands of tasks a
+# second, which can OOM the container. A bounded cap keeps the fan-out concurrent but limits the
+# task churn. Lower = gentler on memory, higher = lower per-observer tail latency.
+BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "256"))
+
 # Verbose per-game / per-connection logging. Enable with DEBUG=1 (or "true"/"yes"/"on").
 DEBUG = os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
@@ -312,9 +318,10 @@ class GameSession:
             await self._broadcast_envelope(MSG_HEADER, payload)
             # The header is what makes a session watchable — before it arrives an observer
             # would connect and sit staring at nothing. Receiving it is therefore the moment
-            # the stream becomes live as far as GO is concerned, so report it: this is what
-            # puts the lobby into GO's livestream menu.
-            mark_observer_change(self.lobby_id)
+            # the stream becomes live as far as GO is concerned, and this report is what puts
+            # the lobby into GO's livestream menu. It goes out now rather than through the
+            # batch: until GO has it, /observe turns players away from a working stream.
+            await report_stream_live(self.lobby_id)
 
     async def apply_patch(self, ws: WebSocket, payload: bytes) -> None:
         """Apply patch to header at given offset, broadcast to observers."""
@@ -542,8 +549,21 @@ class GameSession:
         # than ~50-150 concurrent observers (see plans/relay-scaling-rework.md, "Load test
         # findings"). `dead.append` from concurrent tasks is safe without a lock: asyncio tasks
         # are cooperatively scheduled on one thread, so list.append can't interleave.
-        await asyncio.gather(*(send_one(ws) for ws in
-                                (targets if targets is not None else list(self.observer_ws_set))))
+        #
+        # Cap concurrency: one task per observer per BODY chunk means tens of thousands of task
+        # creations/sec at scale (4 chunks/s x N games x M observers), which can OOM the relay
+        # container. A bounded semaphore keeps the fan-out concurrent but caps the task churn.
+        target_list = targets if targets is not None else list(self.observer_ws_set)
+        if len(target_list) <= BROADCAST_CONCURRENCY:
+            await asyncio.gather(*(send_one(ws) for ws in target_list))
+        else:
+            sem = asyncio.Semaphore(BROADCAST_CONCURRENCY)
+
+            async def send_one_bounded(ws: WebSocket) -> None:
+                async with sem:
+                    await send_one(ws)
+
+            await asyncio.gather(*(send_one_bounded(ws) for ws in target_list))
 
         for ws in dead:
             async with self._lock:
@@ -638,6 +658,38 @@ def _arm_observer_batch() -> None:
     _observer_batch_task = asyncio.create_task(_flush_later())
 
 
+async def report_stream_live(lobby_id: str) -> None:
+    """Tell GO a stream became watchable, without waiting for the batch window.
+
+    Observer counts and stream endings are rough estimates, and coalescing them costs nothing
+    that matters. A stream *starting* is not in that category: GO refuses to admit an observer
+    until it knows the stream is live, so every second spent batching here is a second the game
+    sits in the menu — or fails to appear in it — while being perfectly watchable.
+
+    Falls back to the batch when the POST does not land, so a stream that GO missed is still
+    retried rather than silently never becoming visible. No-op if GO reporting is disabled.
+    """
+    if not GO_OBSERVERS_URL:
+        return
+
+    session = games.get(lobby_id)
+    # Same rule the batch applies: no header means nothing to watch yet, so not live.
+    if session is None or session.ended or not session.header_received:
+        return
+
+    count = len(session.observer_ws_set)
+    entries = [{"lobby_id": str(lobby_id), "observer_count": count, "is_live": True}]
+
+    if await notify_lobby_progress(entries):
+        session._last_reported_observers = count
+        return
+
+    log_warn(f"[LIVESTREAM] [WARN] immediate live report for {lobby_id} failed; falling back "
+             f"to the batch")
+    _observer_dirty.add(lobby_id)
+    _arm_observer_batch()
+
+
 def mark_observer_change(lobby_id: str) -> None:
     """Record that a lobby's observer set changed and arm the shared batch timer.
 
@@ -645,6 +697,9 @@ def mark_observer_change(lobby_id: str) -> None:
     arms a single OBSERVER_CHANGE_TIMEOUT timer; changes that arrive before it fires are added
     to the same batch, and the timer is never reset — the batch always goes out
     OBSERVER_CHANGE_TIMEOUT seconds after the first change. No-op if GO reporting is disabled.
+
+    Counts only. A stream becoming watchable goes out immediately instead — see
+    report_stream_live.
     """
     if not GO_OBSERVERS_URL:
         return

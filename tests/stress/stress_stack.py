@@ -15,6 +15,7 @@ Usage:  python tests/stress/stress_stack.py [--games 10] [--streamers 3] [--obse
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import struct
 import time
@@ -23,10 +24,13 @@ import uuid
 import aiohttp
 import websockets
 
-GO = "http://localhost:8080"
-RELAY_WS = "ws://localhost:8765"
-RELAY_HTTP = "http://localhost:8765"
-RELAY_KEY = "test123"
+# Endpoints are overridable via env so the same script targets a local test stack
+# (defaults) or the batty deployment (e.g. GO=https://batty.youbantoo.club/go
+# RELAY_HTTP=https://batty.youbantoo.club/relay RELAY_KEY=<batty INTERNAL_API_KEY>).
+GO = os.getenv("GO", "http://localhost:8080")
+RELAY_WS = os.getenv("RELAY_WS", "ws://localhost:8765")
+RELAY_HTTP = os.getenv("RELAY_HTTP", "http://localhost:8765")
+RELAY_KEY = os.getenv("RELAY_KEY", "test123")
 
 MSG_REGISTER = 0
 MSG_HEADER = 1
