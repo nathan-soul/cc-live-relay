@@ -26,9 +26,14 @@ tickets, so the mapping is direct.
 
 ### Host authority
 Every player in a lobby is a potential source of replay bytes. Only the **host** describes the
-game: the `lobby` block and `delay_seconds` are accepted from `is_host` registrations and ignored
-from anyone else. Without that rule the published description of a game was a race between eight
-registrations that all arrive within milliseconds of each other.
+game: the `lobby` block is accepted from `is_host` registrations and ignored from anyone else.
+Without that rule the published description of a game was a race between eight registrations that
+all arrive within milliseconds of each other.
+
+`delay_seconds` follows the same principle but arrives earlier and over HTTP: the host reports it
+to GO, GO forwards it on `POST /internal/livestreams`, and it is therefore settled before any
+source connects. A `delay_seconds` in an `is_host` REGISTER frame is only a fallback for a GO
+that does not send one, and never overrides a value GO already supplied.
 
 A session may be opened by whichever client connects first, host or not — rejecting non-hosts
 would drop good sources purely on arrival order. Until the host describes it, the session ingests
@@ -102,7 +107,6 @@ the same host/port, only differing by path.
 | `POST /internal/livestreams` | HTTP | GO announces a livestream; creates/reuses the session. Requires `X-Relay-Key`. Returns `{base_url}` |
 | `POST /internal/stream_tokens` | HTTP | GO mints a single-use stream token for one lobby member. Requires `X-Relay-Key`. Returns `{url}` |
 | `POST /internal/watch_tickets` | HTTP | GO mints a single-use watch ticket for one observer. Requires `X-Relay-Key`. Returns `{url}` |
-| `DELETE /internal/livestreams/{lobbyid}` | HTTP | GO reports the match ended; ends and reaps the session. Requires `X-Relay-Key` |
 | `WS /stream/{lobbyid}?stream_token=KEY` | WebSocket | Streamer connects with a single-use stream token, then sends REGISTER/HEADER/PATCH/BODY/END frames |
 | `WS /watch/{lobbyid}?ticket=KEY` | WebSocket | Observer watches a game (catch-up + live stream) with a single-use watch ticket |
 
@@ -119,9 +123,16 @@ are sent to GO in a single request:
 [{"lobby_id": "123", "observer_count": 4, "is_live": true}]
 ```
 
-A lobby whose stream ended (last source gone / END / inactivity reap / DELETE) is sent with
-`is_live: false` and a count of `0`, which is how GO stops listing it — there is no separate
-"stream ended" notification. Separately, every `OBSERVER_UPDATE_INTERVAL` seconds the same
+`is_live` is the relay's answer to "can somebody watch this right now", and GO's livestream
+menu is driven entirely by it. A lobby turns live when the relay receives the host's replay
+**header** — not when GO registers the livestream, because between those two moments there is
+nothing for an observer to watch. A lobby whose stream ended (last source gone / END /
+inactivity reap) is sent with `is_live: false` and a count of `0`, which is how GO stops
+listing it — there is no separate "stream ended" notification.
+
+A batch is only considered delivered once GO returns a success status; until then the lobbies
+in it stay dirty and are retried, since a dropped `is_live: false` would leave a dead stream in
+GO's menu forever. Separately, every `OBSERVER_UPDATE_INTERVAL` seconds the same
 dirty sets are flushed as a baseline, so a static stream's count never goes stale. Lobbies
 whose count is unchanged from the last posted value are skipped.
 
@@ -132,23 +143,41 @@ watch/stream admission are owned by GO Services.
 
 ## Testing
 
+Everything test-related lives under `tests/`; the repo root holds only the relay itself and how
+to run it. Each suite is a standalone script with its own runner, so it can be executed directly
+from anywhere — `tests/conftest.py` covers collection under pytest as well.
+
 ```bash
 pip install -r requirements-dev.txt
+```
 
-# Integration tests against a live server (needs a running relay on RELAY_TEST_PORT):
-python server.py
-python test_relay.py
+Suites that need nothing but Python:
 
+```bash
 # GO-orchestrated ticket flow, fully mocked (no real GO services call, no real sockets —
 # safe to run anywhere; uses INTERNAL_API_KEY=test123 by default):
-python test_relay_auth_mock.py
+python tests/test_relay_auth_mock.py
 
-# GameSession delivery semantics, no server required:
-python test_session_unit.py
+# GameSession delivery semantics:
+python tests/test_session_unit.py
 
-# Observer-count reporting (debounce + periodic), no server required:
-python test_observer_report.py
+# Batched livestream-state reporting to GO (debounce, retry, periodic baseline):
+python tests/test_observer_report.py
 ```
+
+Suites that drive a running relay over real sockets:
+
+```bash
+python server.py
+python tests/test_relay.py
+
+# End-to-end against a full GO + relay stack:
+python tests/test_stack_client.py --go http://localhost:8080 --relay ws://localhost:8765
+```
+
+`tests/stress/` holds the load harnesses — `loadtest.py` plus the `stress_*.py` scenarios
+(sustained, wave, marquee-game and 226-game shapes). They are measurement tools, not pass/fail
+tests, and each takes `--help`.
 
 ## Development
 

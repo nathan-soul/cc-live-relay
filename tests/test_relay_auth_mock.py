@@ -6,12 +6,18 @@ FastAPI's in-process ASGI TestClient for both HTTP and WebSocket). GO services i
 by the test itself: it sends X-Relay-Key and mints stream tokens / watch tickets via the
 same /internal/* endpoints the real GO RelayClient calls.
 
-Run: python test_relay_auth_mock.py
+Run: python tests/test_relay_auth_mock.py
 """
 import json
 import struct
 import sys
 from contextlib import contextmanager
+from pathlib import Path
+
+# server.py lives at the repo root, one level up from tests/. Inserted here rather than left to
+# the caller so the suite runs identically whether it is invoked directly, from another working
+# directory, or collected by pytest.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 from fastapi.testclient import TestClient
@@ -298,29 +304,6 @@ def test_removed_endpoints_gone(client: TestClient, *_):
         ok(f"/watch-reconnect removed (route gone, got {type(e).__name__})")
 
 
-def test_delete_livestream_ends_session(client: TestClient, *_):
-    print("\n=== DELETE /internal/livestreams/{id} ends the session ===")
-    register_livestream(client, "auth_mock_012", owner_user_id=1)
-    token = mint_stream_token(client, "auth_mock_012", user_id=2)
-    ticket = mint_watch_ticket(client, "auth_mock_012", user_id=3)
-    assert "auth_mock_012" in server.games
-
-    r = client.delete("/internal/livestreams/auth_mock_012", headers=keys())
-    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
-    assert "auth_mock_012" not in server.games
-    ok("DELETE ends and reaps the session")
-
-    r = client.delete("/internal/livestreams/auth_mock_012", headers=keys())
-    assert r.status_code == 404, f"expected 404 on second delete, got {r.status_code}"
-    ok("DELETE of unknown lobby -> 404")
-
-    with client.websocket_connect(f"/watch/auth_mock_012?ticket={ticket}") as ws:
-        raw = ws.receive_bytes()
-        msg_type, payload = unpack_frame(raw)
-        assert msg_type == MSG_ERROR, f"expected ERROR (game ended), got type={msg_type}"
-    ok("watch on ended game -> MSG_ERROR")
-
-
 def test_ticket_gets_configured_ttl(client: TestClient, *_):
     print("\n=== Minted credential gets WATCH_TICKET_TTL_SECONDS (no expires_at in contract) ===")
     register_livestream(client, "auth_mock_013", owner_user_id=1)
@@ -359,7 +342,6 @@ def main():
             test_stream_no_token_rejected,
             test_health_open,
             test_removed_endpoints_gone,
-            test_delete_livestream_ends_session,
             test_ticket_gets_configured_ttl,
         ]
 

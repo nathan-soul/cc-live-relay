@@ -20,7 +20,7 @@ Drives the real GameClient HTTP+WS flow against the local test stack:
 
 Requires the compose test stack up: docker compose -f docker-compose.test.yml up --build
 
-Usage:  python test_stack_client.py [--go http://localhost:8080] [--relay ws://localhost:8765]
+Usage:  python tests/test_stack_client.py [--go http://localhost:8080] [--relay ws://localhost:8765]
 """
 import argparse
 import asyncio

@@ -5,10 +5,14 @@ Unit tests for the relay's batched livestream-state reporting to GO services.
 No server required. The shared batch timer and dirty sets are exercised directly; the outbound
 POST is stubbed so nothing touches the network.
 
-Run: python test_observer_report.py
+Run: python tests/test_observer_report.py
 """
 import asyncio
 import sys
+from pathlib import Path
+
+# server.py lives at the repo root, one level up from tests/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 from server import GameSession
@@ -20,6 +24,19 @@ FAIL = 0
 class FakeWS:
     async def send_bytes(self, data: bytes):
         await asyncio.sleep(0)
+
+
+def live_session(lobby_id: str) -> GameSession:
+    """Register a session GO would consider live.
+
+    A lobby is only reported as live once the relay holds the host's replay header — before
+    that there is nothing for an observer to watch. These tests are about batching rather than
+    header handling, so they start from that point.
+    """
+    session = GameSession(lobby_id)
+    session.header_received = True
+    server.games[lobby_id] = session
+    return session
 
 
 def check(label: str, condition: bool, detail: str = ""):
@@ -46,13 +63,12 @@ async def test_batch_coalesces_multiple_lobbies():
 
     async def stub(entries):
         sent.append(entries)
+        return True    # GO accepted the batch; a falsy return means "retry"
 
     server.notify_lobby_progress = stub
     try:
-        s1 = GameSession("batch_001")
-        s2 = GameSession("batch_002")
-        server.games["batch_001"] = s1
-        server.games["batch_002"] = s2
+        s1 = live_session("batch_001")
+        s2 = live_session("batch_002")
         ws1, ws2, ws3 = FakeWS(), FakeWS(), FakeWS()
 
         await s1.add_observer(ws1)
@@ -93,11 +109,11 @@ async def test_timer_not_reset_by_mid_window_change():
 
     async def stub(entries):
         sent.append(entries)
+        return True    # GO accepted the batch; a falsy return means "retry"
 
     server.notify_lobby_progress = stub
     try:
-        session = GameSession("batch_mid")
-        server.games["batch_mid"] = session
+        session = live_session("batch_mid")
         ws1, ws2 = FakeWS(), FakeWS()
 
         await session.add_observer(ws1)          # arms the timer at t=0
@@ -128,11 +144,11 @@ async def test_unchanged_count_skipped():
 
     async def stub(entries):
         sent.append(entries)
+        return True    # GO accepted the batch; a falsy return means "retry"
 
     server.notify_lobby_progress = stub
     try:
-        session = GameSession("batch_skip")
-        server.games["batch_skip"] = session
+        session = live_session("batch_skip")
         ws1, ws2 = FakeWS(), FakeWS()
 
         await session.add_observer(ws1)
@@ -165,11 +181,11 @@ async def test_ended_stream_sends_is_live_false():
 
     async def stub(entries):
         sent.append(entries)
+        return True    # GO accepted the batch; a falsy return means "retry"
 
     server.notify_lobby_progress = stub
     try:
-        session = GameSession("batch_ended")
-        server.games["batch_ended"] = session
+        session = live_session("batch_ended")
         ws1 = FakeWS()
         await session.add_observer(ws1)          # count change
         server.mark_stream_ended("batch_ended")  # then the stream closes before the flush
@@ -197,11 +213,11 @@ async def test_periodic_flush():
 
     async def stub(entries):
         sent.append(entries)
+        return True    # GO accepted the batch; a falsy return means "retry"
 
     server.notify_lobby_progress = stub
     try:
-        session = GameSession("batch_periodic")
-        server.games["batch_periodic"] = session
+        session = live_session("batch_periodic")
         ws1 = FakeWS()
         await session.add_observer(ws1)
 

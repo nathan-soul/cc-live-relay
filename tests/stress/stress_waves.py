@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
-Ultra-scale stress: 100 games x 5 streamers (500 streamers), then 1500 observers with
-30% (450) on one marquee stream. Every token and ticket is minted through the real GO
-endpoints (livestreams/register + observe) so both GO and the relay are exercised.
+Wave-based burst stress for the GO-orchestrated livestream stack.
 
-  - 100 INGAME lobbies (host login via GO CheckLogin + WS + START_GAME)
-  - 5 streamers per lobby: host via GO /livestreams/register, 4 more via relay internal mint
-    (identical to GO's per-member loop)
-  - 1500 observers: 450 on game 0 (30%), 1050 scattered round-robin over games 1..99.
-    Each: real JWT login -> POST /observe -> watch ticket -> WS /watch, verify HEADER+BODY.
+Models how a real evening goes: streams start in batches (waves), observers join shortly
+after their wave's streams go live, and the FIRST stream (the marquee "popular one everyone
+watches") keeps absorbing viewers for the whole run.
 
-Usage: python stress_mega.py [--games 100] [--streamers 5] [--observers 1500] [--duration 20]
+  - 100 games, 5 streamers each (500 streamers).
+  - Streams come up in waves (default 5 waves of 20 games). Each wave's streamers connect
+    when the wave starts; observers join that wave's streams after WAVE_OBSERVER_DELAY (~3s).
+  - The marquee game (game 0, created first) stays live the whole run and keeps receiving
+    observers across every wave — 30% of total observers (450) land there.
+  - Every token/ticket is minted through the real GO endpoints.
+
+Usage: python tests/stress/stress_waves.py [--games 100] [--streamers 5] [--observers 1500]
 """
 import argparse
 import asyncio
@@ -46,6 +49,10 @@ def unpack(d: bytes):
     return (d[0], d[5:5 + struct.unpack("<I", d[1:5])[0]])
 
 
+def fix_url(url: str) -> str:
+    return url.replace("localhost", "127.0.0.1")
+
+
 class Metrics:
     def __init__(self):
         self.streamer_ok = 0
@@ -54,26 +61,25 @@ class Metrics:
         self.observer_fail = 0
         self.observer_headers = 0
         self.observer_bodies = 0
+        self.marquee_obs_ok = 0
         self.register_fail = 0
         self.observe_fail = 0
         self.login_fail = 0
-        self.chunk_lat = []
         self.bytes_received = 0
         self.errors = []
+        self.observer_lock = asyncio.Lock()
+
+    async def add_marquee(self):
+        async with self.observer_lock:
+            self.marquee_obs_ok += 1
 
     def summary(self):
-        lat = sorted(self.chunk_lat)
-        lat_line = "n/a"
-        if lat:
-            lat_line = (f"n={len(lat)} avg={statistics.mean(lat)*1000:.1f}ms "
-                        f"p50={lat[len(lat)//2]*1000:.1f}ms p95={lat[int(len(lat)*0.95)]*1000:.1f}ms "
-                        f"max={lat[-1]*1000:.1f}ms")
         return "\n".join([
             f"streamers connected: {self.streamer_ok} (failed {self.streamer_fail})",
             f"observers connected: {self.observer_ok} (failed {self.observer_fail})",
+            f"  marquee observers (game 0): {self.marquee_obs_ok}",
             f"observer HEADER received: {self.observer_headers}, BODY received: {self.observer_bodies}",
             f"GO failures -> register {self.register_fail}, observe {self.observe_fail}, login {self.login_fail}",
-            f"live chunk latency: {lat_line}",
             f"bytes received by observers: {self.bytes_received:,}",
             f"errors: {len(self.errors)}",
         ] + (["first 12 errors:"] + [f"  - {e}" for e in self.errors[:12]] if self.errors else []))
@@ -93,8 +99,6 @@ async def login():
 
 
 async def open_go_ws(ws_uri, token):
-    # CheckLogin returns ws://localhost:8080/ws, but localhost may resolve to IPv6 ::1 where
-    # GO doesn't listen — force 127.0.0.1 to reach the container reliably from this host.
     if "localhost" in ws_uri:
         ws_uri = ws_uri.replace("localhost", "127.0.0.1")
     headers = {'Authorization': f"Bearer {token}", 'is-reconnect': 'false',
@@ -119,7 +123,7 @@ async def drain_go(ws, q, stop):
 
 
 async def create_ingame_lobby(token, ws, q):
-    body = {"name": "mega", "map_name": "mega", "map_path": "mega\\mega.map",
+    body = {"name": "wave", "map_name": "wave", "map_path": "wave\\wave.map",
             "map_official": False, "max_players": 8, "preferred_port": 1234,
             "vanilla_teams": True, "track_stats": False, "starting_cash": 10000,
             "passworded": False, "password": "", "allow_observers": True,
@@ -174,12 +178,6 @@ async def observe(token, lobby_id):
             return r.status, d
 
 
-def fix_url(url: str) -> str:
-    """Minted URLs carry PUBLIC_HOST (localhost), which this Windows host resolves to IPv6 ::1
-    where Docker Desktop doesn't publish — force 127.0.0.1 for the connect."""
-    return url.replace("localhost", "127.0.0.1")
-
-
 async def run_streamer(url, chunk_interval, duration, metrics, stop):
     end = time.monotonic() + duration
     url = fix_url(url)
@@ -194,7 +192,7 @@ async def run_streamer(url, chunk_interval, duration, metrics, stop):
             await ws.close()
             return
         metrics.streamer_ok += 1
-        await ws.send(pack(MSG_HEADER, b"MEGA_HEADER"))
+        await ws.send(pack(MSG_HEADER, b"WAVE_HEADER"))
         offset = 0
         while time.monotonic() < end and not stop.is_set():
             await ws.send(pack(MSG_BODY, struct.pack('<Q', offset) + b"B" * 2048))
@@ -207,12 +205,14 @@ async def run_streamer(url, chunk_interval, duration, metrics, stop):
         metrics.errors.append(f"streamer: {type(e).__name__}: {e}")
 
 
-async def run_observer(url, metrics, watch_s, stop):
+async def run_observer(url, metrics, watch_s, stop, is_marquee):
     t0 = time.monotonic()
     url = fix_url(url)
     try:
         ws = await websockets.connect(url, open_timeout=10, ping_interval=20)
         metrics.observer_ok += 1
+        if is_marquee:
+            await metrics.add_marquee()
         got_header = got_body = False
         end = time.monotonic() + watch_s
         while time.monotonic() < end and not stop.is_set():
@@ -240,7 +240,7 @@ async def run_observer(url, metrics, watch_s, stop):
         metrics.errors.append(f"observer: {type(e).__name__}: {e}")
 
 
-async def observer_flow(args, metrics, stop, lobby_id):
+async def observer_flow(metrics, stop, lobby_id, watch_s, is_marquee):
     try:
         user = await login()
         status, obs = await observe(user["session_token"], lobby_id)
@@ -252,7 +252,7 @@ async def observer_flow(args, metrics, stop, lobby_id):
         if not url:
             metrics.observe_fail += 1
             return
-        await run_observer(url, metrics, args.duration, stop)
+        await run_observer(url, metrics, watch_s, stop, is_marquee)
     except Exception as e:
         metrics.observe_fail += 1
         metrics.errors.append(f"observer flow: {type(e).__name__}: {e}")
@@ -264,107 +264,134 @@ async def main():
     ap.add_argument("--streamers", type=int, default=5)
     ap.add_argument("--observers", type=int, default=1500)
     ap.add_argument("--marquee-pct", type=float, default=30.0)
+    ap.add_argument("--waves", type=int, default=5)
+    ap.add_argument("--wave-delay", type=float, default=8.0, help="gap between waves (s)")
+    ap.add_argument("--wave-observer-delay", type=float, default=3.0,
+                    help="observers join a wave's streams this long after the wave starts (s)")
     ap.add_argument("--duration", type=float, default=20.0)
     ap.add_argument("--chunk-interval", type=float, default=0.25)
-    ap.add_argument("--join-stagger", type=float, default=0.01)
     args = ap.parse_args()
 
     metrics = Metrics()
     stop = asyncio.Event()
-    marquee = int(args.observers * args.marquee_pct / 100.0)
-    scatter = args.observers - marquee
+    marquee_total = int(args.observers * args.marquee_pct / 100.0)
+    scatter_total = args.observers - marquee_total
+    games_per_wave = max(1, args.games // args.waves)
     print("=" * 62)
-    print(f"MEGA STRESS: {args.games} games x {args.streamers} streamers "
-          f"({args.games*args.streamers} total), {args.observers} observers "
-          f"({marquee} marquee = {args.marquee_pct}%, {scatter} scattered)")
+    print(f"WAVE BURST: {args.games} games x {args.streamers} streamers "
+          f"({args.games*args.streamers}), {args.observers} observers "
+          f"({marquee_total} marquee = {args.marquee_pct}% on game 0, {scatter_total} scattered), "
+          f"{args.waves} waves")
     print("=" * 62)
 
-    # ── Phase 1: create all lobbies INGAME (serial — ILOVECODE login is not concurrency-safe) ──
-    games = []
-    for i in range(args.games):
-        try:
-            host = await login()
-            ws = await open_go_ws(host["ws_uri"], host["session_token"])
-            q = asyncio.Queue(); st = asyncio.Event()
-            dt = asyncio.create_task(drain_go(ws, q, st))
-            await asyncio.sleep(0.2)
-            lobby_id = await create_ingame_lobby(host["session_token"], ws, q)
-            if lobby_id is not None:
-                games.append({"lobby_id": lobby_id, "host_token": host["session_token"],
-                              "ws": ws, "dt": dt, "st": st})
-            else:
-                metrics.register_fail += 1
-                st.set(); await dt; await ws.close()
-        except Exception as e:
-            metrics.register_fail += 1
-            metrics.errors.append(f"lobby {i} setup: {type(e).__name__}: {e}")
-    print(f"[phase1] created {len(games)}/{args.games} INGAME lobbies")
-
-    # ── Phase 2: streamer URLs (5 per game) ──────────────────────────────
-    streamer_urls = []
-    for game in games:
-        urls = []
-        try:
-            status, reg = await register_livestream(game["host_token"])
-            if status == 200 and reg.get("url"):
-                urls.append(reg["url"])
-            else:
-                metrics.register_fail += 1
-            for _ in range(args.streamers - 1):
-                try:
-                    extra = await login()
-                    urls.append(await internal_stream_token(game["lobby_id"], extra["user_id"]))
-                except Exception as e:
-                    metrics.register_fail += 1
-                    metrics.errors.append(f"extra streamer: {type(e).__name__}: {e}")
-        except Exception as e:
-            metrics.register_fail += 1
-            metrics.errors.append(f"register: {type(e).__name__}: {e}")
-        streamer_urls.append(urls)
-    total_streamer_urls = sum(len(u) for u in streamer_urls)
-    print(f"[phase2] streamer urls minted: {total_streamer_urls} total "
-          f"(marquee={len(streamer_urls[0]) if streamer_urls else 0})")
-
-    # ── Phase 3: connect all streamers, push ─────────────────────────────
-    streamer_tasks = []
-    for urls in streamer_urls:
-        for u in urls:
-            streamer_tasks.append(asyncio.create_task(
-                run_streamer(u, args.chunk_interval, args.duration, metrics, stop)))
-    await asyncio.sleep(2.0)
-
-    # ── Phase 4: observers (marquee on game 0, rest scattered) ───────────
-    # Give the relay a moment to finish accepting the 500-streamer burst so the observer
-    # phase measures fan-out, not connection-accept contention.
-    await asyncio.sleep(2.0)
+    games = []          # {"lobby_id","host_token","ws","dt","st","is_marquee","streamer_urls"}
     observer_tasks = []
-    if games:
-        for _ in range(marquee):
-            observer_tasks.append(asyncio.create_task(
-                observer_flow(args, metrics, stop, games[0]["lobby_id"])))
-            await asyncio.sleep(args.join_stagger)
-    others = games[1:] if len(games) > 1 else []
-    for i in range(scatter):
-        if not others:
-            break
-        observer_tasks.append(asyncio.create_task(
-            observer_flow(args, metrics, stop, others[i % len(others)]["lobby_id"])))
-        await asyncio.sleep(args.join_stagger)
+    streamer_tasks = []
+    go_ws = []          # keep GO sessions alive
 
+    def make_game(lobby_id, host_token, ws, dt, st):
+        return {"lobby_id": lobby_id, "host_token": host_token, "ws": ws, "dt": dt, "st": st,
+                "is_marquee": False, "streamer_urls": []}
+
+    # marquee observers per wave (spread evenly)
+    marquee_per_wave = max(1, marquee_total // args.waves)
+
+    wave_t0 = time.monotonic()
+    for w in range(args.waves):
+        wave_games = []
+        # ── 1. create this wave's lobbies (serial, ILOVECODE not concurrency-safe) ──
+        for i in range(games_per_wave):
+            try:
+                host = await login()
+                ws = await open_go_ws(host["ws_uri"], host["session_token"])
+                q = asyncio.Queue(); st = asyncio.Event()
+                dt = asyncio.create_task(drain_go(ws, q, st))
+                await asyncio.sleep(0.15)
+                lobby_id = await create_ingame_lobby(host["session_token"], ws, q)
+                if lobby_id is None:
+                    metrics.register_fail += 1
+                    st.set(); await dt; await ws.close()
+                    continue
+                g = make_game(lobby_id, host["session_token"], ws, dt, st)
+                if len(games) == 0:
+                    g["is_marquee"] = True   # first stream created = the popular one
+                wave_games.append(g)
+                games.append(g)
+                go_ws.append((ws, st, dt))
+            except Exception as e:
+                metrics.register_fail += 1
+                metrics.errors.append(f"lobby {e}: {type(e).__name__}: {e}")
+
+        # ── 2. register livestreams + mint stream tokens + connect streamers ──
+        wave_streamer_tasks = []
+        for g in wave_games:
+            urls = []
+            try:
+                status, reg = await register_livestream(g["host_token"])
+                if status == 200 and reg.get("url"):
+                    urls.append(reg["url"])
+                else:
+                    metrics.register_fail += 1
+                for _ in range(args.streamers - 1):
+                    extra = await login()
+                    try:
+                        urls.append(await internal_stream_token(g["lobby_id"], extra["user_id"]))
+                    except Exception as e:
+                        metrics.register_fail += 1
+                        metrics.errors.append(f"extra streamer: {type(e).__name__}: {e}")
+            except Exception as e:
+                metrics.register_fail += 1
+                metrics.errors.append(f"register: {type(e).__name__}: {e}")
+            g["streamer_urls"] = urls
+            for u in urls:
+                wave_streamer_tasks.append(asyncio.create_task(
+                    run_streamer(u, args.chunk_interval, args.duration, metrics, stop)))
+        streamer_tasks.extend(wave_streamer_tasks)
+        print(f"[wave {w}] {len(wave_games)} games up, streamers connecting "
+              f"({sum(len(g['streamer_urls']) for g in wave_games)})")
+
+        # ── 3. observers join this wave's streams after a short delay ──
+        async def join_wave(wave_games_, w_):
+            await asyncio.sleep(args.wave_observer_delay)
+            # marquee observers: everyone watches game 0
+            for _ in range(marquee_per_wave):
+                if games:
+                    observer_tasks.append(asyncio.create_task(
+                        observer_flow(metrics, stop, games[0]["lobby_id"],
+                                      args.duration, is_marquee=True)))
+            # scattered observers over this wave's non-marquee games
+            others = [g for g in wave_games_ if not g["is_marquee"]]
+            if others:
+                per = max(1, scatter_total // args.games)
+                for g in others:
+                    for _ in range(per):
+                        observer_tasks.append(asyncio.create_task(
+                            observer_flow(metrics, stop, g["lobby_id"],
+                                          args.duration, is_marquee=False)))
+
+        asyncio.create_task(join_wave(wave_games, w))
+
+        # pace the waves
+        elapsed = time.monotonic() - wave_t0
+        gap = args.wave_delay - elapsed
+        if gap > 0:
+            await asyncio.sleep(gap)
+        wave_t0 = time.monotonic()
+
+    # let all waves finish joining, then run to completion
     start = time.monotonic()
     await asyncio.gather(*streamer_tasks, *observer_tasks, return_exceptions=True)
     elapsed = time.monotonic() - start
     stop.set()
 
-    for g in games:
-        g["st"].set()
-    await asyncio.gather(*[g["dt"] for g in games], return_exceptions=True)
-    await asyncio.gather(*[g["ws"].close() for g in games], return_exceptions=True)
+    for ws, st, dt in go_ws:
+        st.set()
+    await asyncio.gather(*[dt for _, _, dt in go_ws], return_exceptions=True)
+    await asyncio.gather(*[ws.close() for ws, _, _ in go_ws], return_exceptions=True)
 
-    print(f"\nCompleted in {elapsed:.1f}s\n")
+    print(f"\nCompleted in {elapsed:.1f}s (after all waves started)\n")
     print(metrics.summary())
 
-    # GO + relay health after
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{RELAY_HTTP}/health") as r:

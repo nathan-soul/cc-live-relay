@@ -6,7 +6,7 @@ observer catchup over /watch with a GO-minted ticket, dual source dedup, interna
 endpoint auth.
 
 Requires a running relay:  python server.py   (PORT env or default 8765)
-Run:                      python test_relay.py
+Run:                      python tests/test_relay.py
 """
 import asyncio
 import json
@@ -340,31 +340,6 @@ async def test_dual_source_dedup():
     await asyncio.sleep(0.2)
 
 
-async def test_delete_livestream_ends_game():
-    print("\n=== DELETE /internal/livestreams/{id} ends the session ===")
-    import aiohttp
-    await register_livestream("test_game_010")
-    sws = await connect_source("test_game_010", user_id=1)
-    await sws.send(pack_frame(MSG_HEADER, b"DELETE_HEADER"))
-    await asyncio.sleep(0.2)
-
-    async with aiohttp.ClientSession() as s:
-        async with s.delete(f"{HTTP}/internal/livestreams/test_game_010", headers=keys()) as r:
-            assert r.status == 200, f"expected 200, got {r.status}"
-        ok("DELETE /internal/livestreams/{id} -> 200")
-
-    # Watch on the ended game should fail even with a fresh ticket mint path 404ing.
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{HTTP}/internal/watch_tickets",
-                          json={"lobby_id": "test_game_010", "user_id": 9},
-                          headers=keys()) as r:
-            assert r.status == 404, f"expected 404 mint on ended game, got {r.status}"
-        ok("ticket mint for ended game -> 404")
-
-    await sws.close()
-    await asyncio.sleep(0.2)
-
-
 async def test_retired_endpoints_gone():
     print("\n=== Retired endpoints are gone ===")
     import aiohttp
@@ -401,7 +376,6 @@ async def main():
         test_watch_ticket_single_use,
         test_ticket_wrong_lobby_rejected,
         test_dual_source_dedup,
-        test_delete_livestream_ends_game,
         test_retired_endpoints_gone,
     ]
 

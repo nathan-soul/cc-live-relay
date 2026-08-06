@@ -7,7 +7,7 @@ steady rate, and M observers watching that game. Measures connect latency, catch
 latency, live-chunk delivery latency, and error/drop counts.
 
 Usage:
-    python loadtest.py --host batty.youbantoo.club --games 5 --observers-per-game 20 \
+    python tests/stress/loadtest.py --host batty.youbantoo.club --games 5 --observers-per-game 20 \
         --duration 30 --chunk-interval 0.5 --chunk-size 4096
 """
 import argparse

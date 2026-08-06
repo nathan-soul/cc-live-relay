@@ -44,10 +44,10 @@ INACTIVE_GAME_TTL = 60
 # meaningfully watched — see _cleanup_loop.
 UNDESCRIBED_GAME_TTL = int(os.getenv("UNDESCRIBED_GAME_TTL", "120"))
 
-# Broadcast delay: how far behind live an observer is held. The streamer owns this value
-# (it is their spoiler window), sends it in REGISTER, and the relay forwards it to every
-# observer before any replay data. Used when a streamer sends nothing, or runs an older
-# build that does not know about the field.
+# Broadcast delay: how far behind live an observer is held. The host owns this value (it is
+# their spoiler window) and reports it to GO, which forwards it on POST /internal/livestreams;
+# the relay then sends it to every observer before any replay data. Used when neither GO nor
+# the host's REGISTER carries a delay (older build, or nothing sent).
 DEFAULT_DELAY_SECONDS = int(os.getenv("DEFAULT_DELAY_SECONDS", "15"))
 MAX_DELAY_SECONDS = 600
 
@@ -185,6 +185,18 @@ def sanitize_lobby(raw) -> dict:
     return lobby
 
 
+def parse_delay_seconds(raw) -> Optional[int]:
+    """Clamp a supplied broadcast delay into [0, MAX_DELAY_SECONDS]. None if unusable.
+
+    Shared by both sources of the value — GO on /internal/livestreams and the host's REGISTER
+    frame — so a delay is bounded identically no matter which path it arrived on.
+    """
+    try:
+        return max(0, min(int(raw), MAX_DELAY_SECONDS))
+    except (TypeError, ValueError):
+        return None
+
+
 def lobby_player_names(lobby: dict) -> list:
     """Display names of the occupied slots only.
 
@@ -220,6 +232,11 @@ class GameSession:
         self.created_at: float = time.time()
         self.last_active: float = time.time()
         self.delay_seconds: int = DEFAULT_DELAY_SECONDS
+        # Whether delay_seconds came from GO (POST /internal/livestreams). GO is authoritative:
+        # it takes the value from the host when the host registers the stream, and it is settled
+        # before any source connects. The host's REGISTER frame is only a fallback for a
+        # deployment whose GO does not send one, so it must not override this.
+        self.delay_from_go: bool = False
 
         self.header: bytearray = bytearray()
         self.header_received: bool = False
@@ -256,6 +273,11 @@ class GameSession:
                       f"stored={len(self.header)}B, received={len(payload)}B")
         if should_broadcast:
             await self._broadcast_envelope(MSG_HEADER, payload)
+            # The header is what makes a session watchable — before it arrives an observer
+            # would connect and sit staring at nothing. Receiving it is therefore the moment
+            # the stream becomes live as far as GO is concerned, so report it: this is what
+            # puts the lobby into GO's livestream menu.
+            mark_observer_change(self.lobby_id)
 
     async def apply_patch(self, ws: WebSocket, payload: bytes) -> None:
         """Apply patch to header at given offset, broadcast to observers."""
@@ -357,9 +379,8 @@ class GameSession:
             await self._broadcast_envelope(MSG_END, b'')
         # The relay owns closing a stream: when it observes the last source leave (with or
         # without END), it flags the stream ended so the next batch tells GO to stop listing
-        # the livestream. This is the primary teardown signal — GO's DELETE
-        # /internal/livestreams is only a fallback for cases the relay cannot observe (e.g.
-        # GO knows the match ended before the last source disconnected).
+        # the livestream. This is the only teardown signal — GO has no endpoint to close a
+        # stream, because the match ending and the stream ending are different events.
         if ended_here:
             mark_stream_ended(self.lobby_id)
 
@@ -616,56 +637,82 @@ async def flush_observer_batch() -> None:
     with their current count at flush time (so all changes since the last send are reflected)
     and is_live=True; those whose count is unchanged from the last posted value are skipped.
     No-op when nothing is dirty or reporting is disabled.
+
+    Nothing is committed until GO has accepted the batch. A lobby stays dirty and
+    _last_reported_observers stays where it was until the POST succeeds, because a dropped
+    is_live=False would otherwise strand a dead stream in GO's livestream menu permanently,
+    and a dropped count would sit stale until the count happened to change again.
     """
     if not GO_OBSERVERS_URL or (not _observer_dirty and not _ended_dirty):
         return
 
     entries = []
 
-    for lobby_id in list(_ended_dirty):
+    ended_batch = list(_ended_dirty)
+    for lobby_id in ended_batch:
         entries.append({"lobby_id": str(lobby_id), "observer_count": 0, "is_live": False})
-    _ended_dirty.clear()
 
+    observer_batch = []
     for lobby_id in list(_observer_dirty):
         session = games.get(lobby_id)
-        if session is None or session.ended:
+        # A session with no header yet is not watchable, so it is not live: reporting it would
+        # put a lobby in GO's menu that an observer can only stare at. apply_header marks the
+        # lobby dirty again the moment that changes.
+        if session is None or session.ended or not session.header_received:
             _observer_dirty.discard(lobby_id)
             continue
         count = len(session.observer_ws_set)
         if count == session._last_reported_observers:
             _observer_dirty.discard(lobby_id)
             continue
-        session._last_reported_observers = count
+        observer_batch.append((lobby_id, count))
         entries.append({"lobby_id": str(lobby_id), "observer_count": count, "is_live": True})
 
     if not entries:
-        _observer_dirty.clear()
         return
 
-    await notify_lobby_progress(entries)
-    _observer_dirty.clear()
+    if not await notify_lobby_progress(entries):
+        # Leave both dirty sets exactly as they are and try again on the next tick, rather
+        # than dropping state GO never received.
+        _arm_observer_batch()
+        return
+
+    for lobby_id in ended_batch:
+        _ended_dirty.discard(lobby_id)
+
+    for lobby_id, count in observer_batch:
+        session = games.get(lobby_id)
+        if session is not None:
+            session._last_reported_observers = count
+        _observer_dirty.discard(lobby_id)
 
 
-async def notify_lobby_progress(entries: list) -> None:
+async def notify_lobby_progress(entries: list) -> bool:
     """Tell GO services the current livestream state for a set of lobbies.
 
-    Fire-and-forget and never raises: GO being down or unreachable must not affect the relay's
-    own streaming. Authenticates with the relay's own key (GO_API_KEY) as X-Relay-Key, which GO
-    validates against Relay.ingress_api_key.
+    Returns True only when GO accepted the batch. Never raises: GO being down or unreachable
+    must not affect the relay's own streaming, so a failure is reported back as False and the
+    caller retries. Authenticates with the relay's own key (GO_API_KEY) as X-Relay-Key, which
+    GO validates against Relay.ingress_api_key.
     """
     if not GO_OBSERVERS_URL or not entries:
-        return
+        return False
     try:
         async with _get_go_notify_session().post(
             GO_OBSERVERS_URL,
             json=entries,
             headers={"X-Relay-Key": GO_API_KEY} if GO_API_KEY else {},
             timeout=aiohttp.ClientTimeout(total=5),
-        ) as _:
-            pass
+        ) as response:
+            if response.status >= 300:
+                log_warn(f"[LIVESTREAM] [WARN] GO rejected livestream state with HTTP "
+                         f"{response.status}; will retry")
+                return False
         log_debug(f"[LIVESTREAM] notified GO livestream state: {entries}")
+        return True
     except Exception as e:
         log_warn(f"[LIVESTREAM] [WARN] failed to notify GO livestream state: {type(e).__name__}: {e}")
+        return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -725,10 +772,17 @@ def _require_lobby_id(body: dict) -> str:
 
 
 def _require_live_session(lobby_id: str) -> None:
-    """404 unless a live (not ended) session exists for this lobby."""
+    """404 unless a live (not ended) session exists for this lobby.
+
+    The detail carries a machine-readable `code` so GO can tell this apart from a bare routing
+    404 (wrong Relay.base_url, a reverse proxy that mis-handled the path prefix). Both are 404s
+    on the wire, but only this one means the stream is over, and only this one should be shown
+    to a player as "that livestream has ended".
+    """
     session = games.get(lobby_id)
     if not session or session.ended:
-        raise HTTPException(status_code=404, detail="game not found or ended")
+        raise HTTPException(status_code=404,
+                            detail={"code": "stream_ended", "message": "game not found or ended"})
 
 
 def _get_or_create_session(lobby_id: str) -> GameSession:
@@ -766,6 +820,21 @@ async def internal_create_livestream(request: Request):
 
     session = _get_or_create_session(lobby_id)
     session.owner_user_id = body.get("owner_user_id")
+
+    # The broadcast delay the host chose, forwarded by GO. Only the host's registration carries
+    # one (GO sends null for every other member registering their own source), so an absent
+    # value must leave an already-established delay alone rather than reset it.
+    raw_delay = body.get("delay_seconds")
+    if raw_delay is not None:
+        delay = parse_delay_seconds(raw_delay)
+        if delay is None:
+            log_warn(f"[LIVESTREAMER] [WARN] GO sent bad delay_seconds={raw_delay!r} for "
+                     f"lobby={lobby_id}, keeping {session.delay_seconds}")
+        else:
+            session.delay_seconds = delay
+            session.delay_from_go = True
+            log_debug(f"[LIVESTREAMER] [DELAY] Game {lobby_id}: delay_seconds={delay} (from GO)")
+
     log_debug(f"[TICKET] [INTERNAL] livestream registered for lobby={lobby_id}")
     return {"base_url": _public_base(request, lobby_id)}
 
@@ -782,19 +851,11 @@ async def internal_create_watch_ticket(request: Request):
     return await _mint_credential_for_lobby(request, watch_tickets, "watch", "ticket")
 
 
-@app.delete("/internal/livestreams/{lobby_id}")
-async def internal_delete_livestream(lobby_id: str, request: Request):
-    """GO reports the match ended. Ends the session and reaps it."""
-    _require_internal_key(request)
-    session = games.get(lobby_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="game not found")
-    session.ended = True
-    await session._broadcast_envelope(MSG_END, b'')
-    mark_stream_ended(lobby_id)
-    games.pop(lobby_id, None)
-    log_debug(f"[TICKET] [INTERNAL] livestream ended lobby={lobby_id}")
-    return {"detail": "ok"}
+# There is deliberately no DELETE /internal/livestreams/{lobby_id}. The relay owns closing a
+# stream: it is the only party that can see the last source leave, an END frame arrive, or a
+# session go quiet, and it reports that to GO as is_live=False. GO ending the match is not the
+# same event as the stream ending (a match can run on with nobody streaming it), so a GO-driven
+# teardown would only add a second, racier path to the same state.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -832,7 +893,8 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
     role: str = "unknown"
 
     token = websocket.query_params.get("stream_token")
-    if consume_stream_token(token, lobby_id) is None:
+    credential = consume_stream_token(token, lobby_id)
+    if credential is None:
         await reject(websocket, "Invalid or expired stream token")
         return
 
@@ -856,7 +918,6 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
 
         player_name = reg.get("player_name", "unknown")
         can_stream = reg.get("can_stream", False)
-        is_host = bool(reg.get("is_host", False))
 
         if not can_stream:
             await reject(websocket, "stream token valid, but can_stream required")
@@ -869,6 +930,13 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
         session = _get_or_create_session(lobby_id)
 
         # ── Host-authoritative fields ──────────────────────────────────
+        # Host authority is GO's to grant, not the client's to claim. GO records the lobby's
+        # owner on the session and mints each stream token against a specific user id, so the
+        # two are compared here instead of trusting an is_host flag in the REGISTER payload —
+        # otherwise any member could relabel the game every other member is streaming.
+        is_host = (session.owner_user_id is not None and
+                   credential.get("user_id") == session.owner_user_id)
+
         if is_host:
             lobby = sanitize_lobby(reg.get("lobby"))
             if lobby:
@@ -877,15 +945,19 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
                           f"'{lobby.get('name', '')}' on '{lobby.get('mapname', '')}' "
                           f"({len(lobby_player_names(lobby))} players) for {session.lobby_id}")
 
+            # Fallback only: GO forwards the host's delay on /internal/livestreams before any
+            # source connects, and that value wins. This path covers a GO that does not send
+            # one (older services build), so it must not undo what GO already established.
             raw_delay = reg.get("delay_seconds")
-            if raw_delay is not None:
-                try:
-                    session.delay_seconds = max(0, min(int(raw_delay), MAX_DELAY_SECONDS))
-                    log_debug(f"[LIVESTREAMER] [DELAY] Game {session.lobby_id}: "
-                          f"delay_seconds={session.delay_seconds}")
-                except (TypeError, ValueError):
+            if raw_delay is not None and not session.delay_from_go:
+                delay = parse_delay_seconds(raw_delay)
+                if delay is None:
                     log_warn(f"[LIVESTREAMER] [WARN] bad delay_seconds={raw_delay!r}, "
                           f"keeping {session.delay_seconds}")
+                else:
+                    session.delay_seconds = delay
+                    log_debug(f"[LIVESTREAMER] [DELAY] Game {session.lobby_id}: "
+                          f"delay_seconds={session.delay_seconds} (from REGISTER)")
 
         role = "streamer"
         async with session._lock:
@@ -1093,6 +1165,9 @@ if __name__ == "__main__":
     print(f"[START] Max observers: {MAX_OBSERVERS_PER_GAME}, Chunk size: {CHUNK_SIZE} bytes")
     if not INTERNAL_API_KEY:
         print("[START] WARNING: INTERNAL_API_KEY is not set — /internal/* endpoints will refuse all calls")
+    if not GO_OBSERVERS_URL:
+        print("[START] WARNING: GO_OBSERVERS_URL is not set — GO is told nothing about livestream "
+              "state, so no stream will ever appear in its livestream menu")
     if GO_OBSERVERS_URL and not GO_API_KEY:
         print("[START] WARNING: GO_OBSERVERS_URL is set but GO_API_KEY is not — "
               "GO will reject the observer-count notification (401)")

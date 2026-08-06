@@ -9,11 +9,15 @@ replay file: observers write each BODY chunk at its absolute file offset, so a c
 delivered out of order leaves a hole, and a chunk delivered twice rewinds the client's
 parse cursor.
 
-Run: python test_session_unit.py
+Run: python tests/test_session_unit.py
 """
 import asyncio
 import struct
 import sys
+from pathlib import Path
+
+# server.py lives at the repo root, one level up from tests/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
 from server import GameSession, MSG_ROLE, MSG_HEADER, MSG_BODY

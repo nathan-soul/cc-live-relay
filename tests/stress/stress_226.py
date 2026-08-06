@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Stress test for the full GO-orchestrated livestream stack.
+GO-scale stress test modeled on a real Generals Online evening:
+  1000 players in 226 matches (~5 players/game), 250 people in menus scattering over
+  livestreams. One marquee match (popular player vs rival) draws 40% of the viewers.
 
-Profile (default): 10 games, 3 streamers per game, 25 observers per game.
-  - 10 GO lobbies created as INGAME (host login via CheckLogin + WS + START_GAME).
-  - Host of each lobby calls POST /Livestreams/register with a real JWT -> stream tokens.
-  - 2 additional streamers per lobby get tokens via the relay internal mint endpoint
-    (identical to GO's per-member RegisterLivestream loop).
-  - 3 streamers per lobby connect WS /stream and push replay data concurrently.
-  - 25 observers per game: real JWT login -> POST /observe -> watch ticket -> WS /watch.
+Profile:
+  - 226 games, each with 1 streamer (the host's token via GO /livestreams/register)
+  - The marquee game (game 0) gets a 2nd streamer (the rival) via the relay internal mint
+  - 250 observers total: 100 (40%) on the marquee game, 150 scattered round-robin over the
+    other 225 games
+  - All observers: real JWT login -> POST /observe -> watch ticket -> WS /watch
 
-Usage:  python stress_stack.py [--games 10] [--streamers 3] [--observers 25] [--duration 20]
+Usage: python tests/stress/stress_226.py [--games 226] [--observers 250] [--marquee-pct 40] [--duration 20]
 """
 import argparse
 import asyncio
@@ -18,7 +19,6 @@ import json
 import statistics
 import struct
 import time
-import uuid
 
 import aiohttp
 import websockets
@@ -78,8 +78,8 @@ class Metrics:
             f"errors: {len(self.errors)}",
         ]
         if self.errors:
-            lines.append("first 10 errors:")
-            for e in self.errors[:10]:
+            lines.append("first 12 errors:")
+            for e in self.errors[:12]:
                 lines.append(f"  - {e}")
         return "\n".join(lines)
 
@@ -123,9 +123,9 @@ async def drain_go(ws, q, stop):
 
 
 async def create_ingame_lobby(token, ws, q):
-    """Host creates a lobby and starts the game. Returns lobby_id."""
+    """Host creates a lobby and starts the game. Returns lobby_id (or None)."""
     body = {"name": "stress", "map_name": "stress map", "map_path": "stress\\stress.map",
-            "map_official": False, "max_players": 8, "preferred_port": 1234,
+            "map_official": False, "max_players": 5, "preferred_port": 1234,
             "vanilla_teams": True, "track_stats": False, "starting_cash": 10000,
             "passworded": False, "password": "", "allow_observers": True,
             "max_cam_height": 3000.0, "exe_crc": 0, "ini_crc": 0, "anticheat_id": 0}
@@ -150,7 +150,7 @@ async def create_ingame_lobby(token, ws, q):
             return None
         if m.get("msg_id") == START_GAME:
             return lobby_id
-    return lobby_id  # best effort; lobby may still be INGAME
+    return lobby_id
 
 
 async def register_livestream(token):
@@ -181,7 +181,6 @@ async def observe(token, lobby_id):
 
 
 async def run_streamer(url, chunk_interval, duration, metrics, stop):
-    """One streamer: connect /stream, push HEADER + periodic BODY until duration elapses."""
     end_time = time.monotonic() + duration
     try:
         ws = await websockets.connect(url, open_timeout=10, ping_interval=20)
@@ -211,7 +210,6 @@ async def run_streamer(url, chunk_interval, duration, metrics, stop):
 
 
 async def run_observer(url, metrics, watch_s, stop):
-    """One observer: connect /watch, verify HEADER+BODY, sample latency."""
     t0 = time.monotonic()
     try:
         ws = await websockets.connect(url, open_timeout=10, ping_interval=20)
@@ -251,117 +249,7 @@ async def run_observer(url, metrics, watch_s, stop):
         metrics.errors.append(f"observer: {type(e).__name__}: {e}")
 
 
-async def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--games", type=int, default=10)
-    ap.add_argument("--streamers", type=int, default=3)
-    ap.add_argument("--observers", type=int, default=25)
-    ap.add_argument("--duration", type=float, default=20.0)
-    ap.add_argument("--chunk-interval", type=float, default=0.25)
-    ap.add_argument("--join-stagger", type=float, default=0.05)
-    args = ap.parse_args()
-
-    metrics = Metrics()
-    stop = asyncio.Event()
-    total_streamers = args.games * args.streamers
-    total_observers = args.games * args.observers
-    print("=" * 60)
-    print(f"FULL-STACK STRESS TEST: {args.games} games, {args.streamers} streamers/game "
-          f"({total_streamers}), {args.observers} observers/game ({total_observers}), "
-          f"duration {args.duration}s")
-    print("=" * 60)
-
-    # ── Phase 1: create all lobbies as INGAME ────────────────────────────
-    lobbies = []  # (lobby_id, stream_urls[3], host_token)
-    for g in range(args.games):
-        try:
-            host = await login()
-            ws = await open_go_ws(host["ws_uri"], host["session_token"])
-            q = asyncio.Queue()
-            st = asyncio.Event()
-            dt = asyncio.create_task(drain_go(ws, q, st))
-            await asyncio.sleep(0.3)
-            lobby_id = await create_ingame_lobby(host["session_token"], ws, q)
-            if lobby_id is None:
-                metrics.reg_fail += 1
-                metrics.errors.append(f"lobby {g}: no lobby_id")
-                dt.cancel()
-                await ws.close()
-                continue
-            lobbies.append((lobby_id, host["session_token"]))
-            st.set()
-            await dt
-            await ws.close()
-        except Exception as e:
-            metrics.reg_fail += 1
-            metrics.errors.append(f"lobby {g} setup: {type(e).__name__}: {e}")
-    print(f"[phase1] created {len(lobbies)} INGAME lobbies")
-
-    # ── Phase 2: register livestreams, get stream URLs ───────────────────
-    stream_urls = []  # per game: list of 3 stream urls
-    for lobby_id, host_token in lobbies:
-        urls = []
-        try:
-            status, reg = await register_livestream(host_token)
-            if status == 200:
-                host_url = reg.get("url")
-                if host_url:
-                    urls.append(host_url)
-            else:
-                metrics.reg_fail += 1
-                metrics.errors.append(f"register lobby {lobby_id}: {status} {reg.get('detail')}")
-            # 2 extra streamers via the relay internal mint (GO's per-member loop)
-            for extra in range(args.streamers - 1):
-                try:
-                    extra_user = await login()
-                    u = await relay_internal_stream_token(lobby_id, extra_user["user_id"])
-                    urls.append(u)
-                except Exception as e:
-                    metrics.reg_fail += 1
-                    metrics.errors.append(f"extra streamer lobby {lobby_id}: {type(e).__name__}: {e}")
-        except Exception as e:
-            metrics.reg_fail += 1
-            metrics.errors.append(f"register loop lobby {lobby_id}: {type(e).__name__}: {e}")
-        stream_urls.append(urls)
-    print(f"[phase2] streamer URLs per game: {[len(u) for u in stream_urls]}")
-
-    # ── Phase 3: connect all streamers, push data ────────────────────────
-    streamer_tasks = []
-    for urls in stream_urls:
-        for u in urls:
-            streamer_tasks.append(asyncio.create_task(
-                run_streamer(u, args.chunk_interval, args.duration, metrics, stop)))
-    await asyncio.sleep(1.5)  # let streamers register + send header
-
-    # ── Phase 4: observers join (real JWT -> observe -> watch) ───────────
-    observer_tasks = []
-    for lobby_id, _ in lobbies:
-        for i in range(args.observers):
-            observer_tasks.append(asyncio.create_task(observer_flow(
-                args, metrics, stop, lobby_id)))
-            await asyncio.sleep(args.join_stagger)
-
-    start = time.monotonic()
-    await asyncio.gather(*streamer_tasks, *observer_tasks, return_exceptions=True)
-    elapsed = time.monotonic() - start
-    stop.set()
-
-    print(f"\nCompleted in {elapsed:.1f}s\n")
-    print(metrics.summary())
-
-    # health snapshot
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(f"{RELAY_HTTP}/health") as r:
-                print(f"[health] {await r.text()}")
-    except Exception as e:
-        print(f"[health] {type(e).__name__}: {e}")
-
-    return metrics.observer_fail == 0 and metrics.streamer_fail == 0
-
-
 async def observer_flow(args, metrics, stop, lobby_id):
-    """One observer: login, observe, connect watch."""
     try:
         user = await login()
         status, obs = await observe(user["session_token"], lobby_id)
@@ -378,6 +266,129 @@ async def observer_flow(args, metrics, stop, lobby_id):
     except Exception as e:
         metrics.observe_fail += 1
         metrics.errors.append(f"observer flow: {type(e).__name__}: {e}")
+
+
+async def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--games", type=int, default=226)
+    ap.add_argument("--observers", type=int, default=250)
+    ap.add_argument("--marquee-pct", type=float, default=40.0)
+    ap.add_argument("--duration", type=float, default=20.0)
+    ap.add_argument("--chunk-interval", type=float, default=0.25)
+    ap.add_argument("--join-stagger", type=float, default=0.02)
+    args = ap.parse_args()
+
+    metrics = Metrics()
+    stop = asyncio.Event()
+    marquee_viewers = int(args.observers * args.marquee_pct / 100.0)
+    scatter_viewers = args.observers - marquee_viewers
+    print("=" * 62)
+    print(f"GO-SCALE STRESS: {args.games} games, {args.observers} observers "
+          f"({marquee_viewers} marquee = {args.marquee_pct}%, {scatter_viewers} scattered), "
+          f"duration {args.duration}s")
+    print("=" * 62)
+
+    # ── Phase 1: create all lobbies INGAME (serial — the ILOVECODE dev login is not
+    # concurrency-safe: each CheckLogin computes the next user_id from live sessions and
+    # calls ClearDataFromUser, so parallel logins can wipe each other's sessions) ──
+    games = []
+    for i in range(args.games):
+        try:
+            host = await login()
+            ws = await open_go_ws(host["ws_uri"], host["session_token"])
+            q = asyncio.Queue()
+            st = asyncio.Event()
+            dt = asyncio.create_task(drain_go(ws, q, st))
+            await asyncio.sleep(0.2)
+            lobby_id = await create_ingame_lobby(host["session_token"], ws, q)
+            if lobby_id is not None:
+                games.append({"lobby_id": lobby_id, "host_token": host["session_token"],
+                              "ws": ws, "drain_task": dt, "drain_stop": st})
+            else:
+                metrics.reg_fail += 1
+                metrics.errors.append(f"lobby {i} setup: no lobby_id")
+                st.set()
+                await dt
+                await ws.close()
+        except Exception as e:
+            metrics.reg_fail += 1
+            metrics.errors.append(f"lobby {i} setup: {type(e).__name__}: {e}")
+    print(f"[phase1] created {len(games)}/{args.games} INGAME lobbies")
+
+    # ── Phase 2: streamer URLs ───────────────────────────────────────────
+    # game 0 = marquee (2 streamers: host + rival); others 1 streamer (host)
+    streamer_urls = []  # index aligns with games
+    for gi, game in enumerate(games):
+        urls = []
+        try:
+            status, reg = await register_livestream(game["host_token"])
+            if status == 200 and reg.get("url"):
+                urls.append(reg["url"])
+            else:
+                metrics.reg_fail += 1
+                metrics.errors.append(f"register {game['lobby_id']}: {status} {reg.get('detail')}")
+            if gi == 0:  # marquee: rival also streams
+                rival = await login()
+                try:
+                    urls.append(await relay_internal_stream_token(game["lobby_id"], rival["user_id"]))
+                except Exception as e:
+                    metrics.reg_fail += 1
+                    metrics.errors.append(f"rival token: {type(e).__name__}: {e}")
+        except Exception as e:
+            metrics.reg_fail += 1
+            metrics.errors.append(f"register loop: {type(e).__name__}: {e}")
+        streamer_urls.append(urls)
+    print(f"[phase2] streamer urls: {sum(len(u) for u in streamer_urls)} total "
+          f"(marquee={len(streamer_urls[0]) if streamer_urls else 0})")
+
+    # ── Phase 3: connect streamers, push ─────────────────────────────────
+    streamer_tasks = []
+    for urls in streamer_urls:
+        for u in urls:
+            streamer_tasks.append(asyncio.create_task(
+                run_streamer(u, args.chunk_interval, args.duration, metrics, stop)))
+    await asyncio.sleep(2.0)
+
+    # ── Phase 4: observers with distribution ─────────────────────────────
+    observer_tasks = []
+    # marquee game gets marquee_viewers
+    if games:
+        for _ in range(marquee_viewers):
+            observer_tasks.append(asyncio.create_task(
+                observer_flow(args, metrics, stop, games[0]["lobby_id"])))
+            await asyncio.sleep(args.join_stagger)
+    # scatter the rest round-robin over games[1:]
+    others = games[1:] if len(games) > 1 else []
+    for i in range(scatter_viewers):
+        if not others:
+            break
+        game = others[i % len(others)]
+        observer_tasks.append(asyncio.create_task(
+            observer_flow(args, metrics, stop, game["lobby_id"])))
+        await asyncio.sleep(args.join_stagger)
+
+    start = time.monotonic()
+    await asyncio.gather(*streamer_tasks, *observer_tasks, return_exceptions=True)
+    elapsed = time.monotonic() - start
+    stop.set()
+
+    # teardown host WS
+    for g in games:
+        g["drain_stop"].set()
+    await asyncio.gather(*[g["drain_task"] for g in games], return_exceptions=True)
+    await asyncio.gather(*[g["ws"].close() for g in games], return_exceptions=True)
+
+    print(f"\nCompleted in {elapsed:.1f}s\n")
+    print(metrics.summary())
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{RELAY_HTTP}/health") as r:
+                print(f"[health] {await r.text()}")
+    except Exception as e:
+        print(f"[health] {type(e).__name__}: {e}")
+
+    return metrics.observer_fail == 0 and metrics.streamer_fail == 0
 
 
 if __name__ == "__main__":

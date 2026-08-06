@@ -1,4 +1,14 @@
 __pycache__/
+.pytest_cache/
 .venv/
 relay.log
 replays/*
+
+# Deployment artefacts stay out of the repo. A compose stack encodes one machine's hostnames,
+# routing and TLS contacts, and the .env beside it holds that machine's live keys — none of
+# which belong in a shared history. Keep them on the host that runs them.
+.env
+.env.*
+Dockerfile
+.dockerignore
+docker-compose*.yml
