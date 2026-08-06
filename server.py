@@ -18,6 +18,7 @@ import os
 import secrets
 import struct
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -123,7 +124,43 @@ def log_warn(*args) -> None:
 
 
 # ── App ────────────────────────────────────────────────────────────────────
-app = FastAPI(title="cc-live-relay", version="0.5.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run the background loops for as long as the app is serving.
+
+    The loops are held in a list rather than fired and forgotten: asyncio keeps only a weak
+    reference to a running task, so one nobody holds can be garbage-collected mid-flight.
+    Cancelling them on the way out (along with any pending observer batch) lets the process
+    exit promptly instead of sitting on a sleep.
+
+    _cleanup_loop and _observer_report_loop are defined further down the module; the names
+    resolve when this body runs at startup, not when the app is constructed.
+    """
+    background = [
+        asyncio.create_task(_cleanup_loop()),
+        asyncio.create_task(_observer_report_loop()),
+    ]
+    try:
+        yield
+    finally:
+        global _go_notify_session, _observer_batch_task
+
+        if _observer_batch_task is not None:
+            background.append(_observer_batch_task)
+            _observer_batch_task = None
+
+        for task in background:
+            task.cancel()
+        await asyncio.gather(*background, return_exceptions=True)
+
+        # Close the shared outbound session so the process exits cleanly.
+        if _go_notify_session is not None:
+            await _go_notify_session.close()
+            _go_notify_session = None
+
+
+app = FastAPI(title="cc-live-relay", version="0.5.0", lifespan=lifespan)
 
 
 # ── Binary envelope helpers ────────────────────────────────────────────────
@@ -1072,21 +1109,6 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
 # ═══════════════════════════════════════════════════════════════════════════
 # Background cleanup
 # ═══════════════════════════════════════════════════════════════════════════
-
-@app.on_event("startup")
-async def start_cleanup_task():
-    asyncio.create_task(_cleanup_loop())
-    asyncio.create_task(_observer_report_loop())
-
-
-@app.on_event("shutdown")
-async def stop_http_client():
-    """Close the shared outbound session so the process exits cleanly."""
-    global _go_notify_session
-    if _go_notify_session is not None:
-        await _go_notify_session.close()
-        _go_notify_session = None
-
 
 async def _cleanup_loop():
     """Periodically remove ended/inactive/undescribed games; purge expired credentials."""
