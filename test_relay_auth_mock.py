@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
 """
-Exercises the REQUIRE_WATCH_AUTH ticket flow and the ENABLE_SELF_VIEW_BLOCK IP check end-to-end
-against a mocked GO Users/Me response — no real network call to GeneralsOnline, no real TCP
-sockets at all (uses FastAPI's in-process ASGI TestClient for both HTTP and WebSocket). This is
-deliberately independent of however the real GO-services mock/integration ends up working — it
-only needs server.http_client to behave like an aiohttp.ClientSession, which is the one seam
-server.py already calls through.
-
-Self-view tests rely on the TestClient giving every connection (source and observer) the same
-peer address ("testclient"), which is exactly the same-IP condition the block keys on.
+Exercises the GO-orchestrated ticket flow end-to-end against the relay's /internal/*
+endpoints — no real network call to GeneralsOnline, no real TCP sockets at all (uses
+FastAPI's in-process ASGI TestClient for both HTTP and WebSocket). GO services is mocked
+by the test itself: it sends X-Relay-Key and mints stream tokens / watch tickets via the
+same /internal/* endpoints the real GO RelayClient calls.
 
 Run: python test_relay_auth_mock.py
 """
@@ -19,6 +15,7 @@ from contextlib import contextmanager
 
 import server
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 PASS = 0
 FAIL = 0
@@ -30,6 +27,7 @@ MSG_END      = 4
 MSG_ROLE     = 5
 MSG_ERROR    = 6
 
+RELAY_KEY = "test123"
 
 def pack_frame(msg_type: int, payload: bytes = b"") -> bytes:
     return bytes([msg_type]) + struct.pack('<I', len(payload)) + payload
@@ -71,69 +69,47 @@ def fail(name, reason=""):
     print(f"  [FAIL] {name} -- {reason}")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Fake stand-in for aiohttp.ClientSession, mocking GO's Users/Me.
-#
-# Real shape confirmed live against api.playgenerals.online during design (401 with
-# WWW-Authenticate: Bearer error="invalid_token" for a bad token) and from
-# GenOnlineService/Controllers/User/UserController.cs's MyUser(): 200 {user_id, display_name}
-# for a valid GameClient/ChatClient/GameLauncher-role token, 401 otherwise (the JWT bearer
-# middleware rejects before the controller body runs, so there's no other status to model).
-# ═══════════════════════════════════════════════════════════════════════════
-
-class FakeUsersMeResponse:
-    def __init__(self, status: int, body: dict):
-        self.status = status
-        self._body = body
-
-    async def json(self):
-        return self._body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-
-class FakeHTTPClient:
-    """Drop-in for the one aiohttp.ClientSession call site server.py uses (mint_ticket)."""
-
-    def __init__(self):
-        self._responses: dict[str, tuple[int, dict]] = {}
-
-    def set_valid_token(self, token: str, user_id: int, display_name: str = "TestUser"):
-        self._responses[token] = (200, {"user_id": user_id, "display_name": display_name})
-
-    def set_token_status(self, token: str, status: int, body: dict = None):
-        """Model GO's 403 (banned) / 404 (deleted user) / anything else — same shape as a real
-        Users/Me response for that status, per the relay's per-status handling in mint_ticket()."""
-        self._responses[token] = (status, body or {})
-
-    async def close(self) -> None:
-        pass  # nothing real to close; matches aiohttp.ClientSession's interface
-
-    def get(self, url, headers=None, timeout=None):
-        auth = (headers or {}).get("Authorization", "")
-        token = auth[len("Bearer "):] if auth.startswith("Bearer ") else auth
-        status, body = self._responses.get(token, (401, {}))
-        return FakeUsersMeResponse(status, body)
+def keys():
+    return {"X-Relay-Key": RELAY_KEY}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Test helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-@contextmanager
-def open_source(client: TestClient, lobby_id: str, player_name: str):
-    """Keeps the source connection open for the duration of the `with` block.
+def register_livestream(client: TestClient, lobby_id: str, owner_user_id: int = 1) -> dict:
+    """GO announces a livestream (POST /internal/livestreams). Returns the response json."""
+    r = client.post("/internal/livestreams", json={"lobby_id": lobby_id, "owner_user_id": owner_user_id},
+                    headers=keys())
+    assert r.status_code == 200, f"livestream register failed: {r.status_code} {r.text}"
+    return r.json()
 
-    Ticket-minting and /watch checks need the session to still be alive (not `ended`) while
-    they run — a source that disconnects right after sending END is exactly what legitimately
-    ends a GameSession (see register_endpoint's finally -> remove_source), so the caller must
-    do its ticket/watch work *inside* this block, not after it returns.
+
+def mint_stream_token(client: TestClient, lobby_id: str, user_id: int) -> str:
+    r = client.post("/internal/stream_tokens",
+                    json={"lobby_id": lobby_id, "user_id": user_id},
+                    headers=keys())
+    assert r.status_code == 200, f"stream token mint failed: {r.status_code} {r.text}"
+    return r.json()["url"].split("stream_token=")[1]
+
+
+def mint_watch_ticket(client: TestClient, lobby_id: str, user_id: int) -> str:
+    r = client.post("/internal/watch_tickets",
+                    json={"lobby_id": lobby_id, "user_id": user_id},
+                    headers=keys())
+    assert r.status_code == 200, f"watch ticket mint failed: {r.status_code} {r.text}"
+    return r.json()["url"].split("ticket=")[1]
+
+
+@contextmanager
+def open_source(client: TestClient, lobby_id: str, player_name: str, token: str):
+    """Keeps a streamer connected for the duration of the `with` block (token already minted).
+
+    Ticket/stream admission needs the session to still be alive (not `ended`) while tests
+    run — a source that disconnects right after sending END is exactly what legitimately
+    ends a GameSession, so the caller must do its watch work *inside* this block.
     """
-    with client.websocket_connect("/register") as ws:
+    with client.websocket_connect(f"/stream/{lobby_id}?stream_token={token}") as ws:
         ws.send_bytes(pack_frame(MSG_REGISTER, json.dumps({
             "lobbyid": lobby_id,
             "player_name": player_name,
@@ -151,202 +127,209 @@ def open_source(client: TestClient, lobby_id: str, player_name: str):
 # Tests
 # ═══════════════════════════════════════════════════════════════════════════
 
-def test_ticket_mint_valid_token(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Ticket mint: valid (mocked) token ===")
-    with open_source(client, "auth_mock_001", "Host1"):
-        fake_http.set_valid_token("good-token-1", user_id=42, display_name="Alice")
-        r = client.get("/watch/auth_mock_001/ticket", headers={"Authorization": "Bearer good-token-1"})
-        assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
-        data = r.json()
-        assert "ticket=" in data["url"], f"ticket param missing from url: {data}"
-        assert data["expires_in"] == server.WATCH_TICKET_TTL_SECONDS
-        ok(f"mocked valid token -> 200, ticket URL minted ({data['url']})")
+def test_internal_key_required(client: TestClient, *_):
+    print("\n=== Internal endpoints reject bad/missing relay key ===")
+    with client.websocket_connect("/watch/no_key_game") as ws:
+        ws.receive_bytes()  # drains the accept
+    r = client.post("/internal/livestreams", json={"lobby_id": "key_001", "owner_user_id": 1})
+    assert r.status_code == 401, f"expected 401 missing key, got {r.status_code}"
+    ok("missing X-Relay-Key -> 401")
+
+    r = client.post("/internal/livestreams", json={"lobby_id": "key_002", "owner_user_id": 1},
+                    headers={"X-Relay-Key": "wrong-key"})
+    assert r.status_code == 401, f"expected 401 wrong key, got {r.status_code}"
+    ok("wrong X-Relay-Key -> 401")
 
 
-def test_ticket_mint_invalid_token(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Ticket mint: invalid (mocked) token ===")
-    with open_source(client, "auth_mock_002", "Host2"):
-        r = client.get("/watch/auth_mock_002/ticket", headers={"Authorization": "Bearer garbage-token"})
-        assert r.status_code == 401, f"expected 401, got {r.status_code}"
-        ok("mocked invalid token -> 401, matching GO's real Users/Me behavior")
+def test_livestream_register_and_base_url(client: TestClient, *_):
+    print("\n=== POST /internal/livestreams creates a session ===")
+    data = register_livestream(client, "auth_mock_001", owner_user_id=42)
+    assert "base_url" in data, f"missing base_url: {data}"
+    assert "/stream/auth_mock_001" in data["base_url"], f"base_url wrong: {data}"
+    ok(f"livestream registered, base_url={data['base_url']}")
+    ok("session exists for lobby")
+    assert "auth_mock_001" in server.games
 
 
-def test_ticket_mint_banned_user(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Ticket mint: GO reports the account banned (403) ===")
-    with open_source(client, "auth_mock_010", "Host10"):
-        fake_http.set_token_status("banned-token", 403)
-        r = client.get("/watch/auth_mock_010/ticket", headers={"Authorization": "Bearer banned-token"})
-        assert r.status_code == 403, f"expected 403, got {r.status_code}"
-        ok("GO 403 (banned/unauthorized) forwarded as-is, not collapsed into a generic 401")
+def test_stream_token_unknown_lobby(client: TestClient, *_):
+    print("\n=== Stream token for unknown lobby -> 404 ===")
+    r = client.post("/internal/stream_tokens",
+                    json={"lobby_id": "no_such_lobby", "user_id": 1},
+                    headers=keys())
+    assert r.status_code == 404, f"expected 404, got {r.status_code}"
+    ok("stream token mint for unknown lobby -> 404")
 
 
-def test_ticket_mint_deleted_user(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Ticket mint: GO reports the account no longer exists (404) ===")
-    with open_source(client, "auth_mock_011", "Host11"):
-        fake_http.set_token_status("deleted-user-token", 404)
-        r = client.get("/watch/auth_mock_011/ticket", headers={"Authorization": "Bearer deleted-user-token"})
-        assert r.status_code == 404, f"expected 404, got {r.status_code}"
-        ok("GO 404 (deleted user) forwarded as-is")
+def test_watch_ticket_unknown_lobby(client: TestClient, *_):
+    print("\n=== Watch ticket for unknown lobby -> 404 ===")
+    r = client.post("/internal/watch_tickets",
+                    json={"lobby_id": "no_such_lobby_2", "user_id": 1},
+                    headers=keys())
+    assert r.status_code == 404, f"expected 404, got {r.status_code}"
+    ok("watch ticket mint for unknown lobby -> 404")
 
 
-def test_ticket_mint_unexpected_status(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Ticket mint: GO returns something unrecognized ===")
-    with open_source(client, "auth_mock_012", "Host12"):
-        fake_http.set_token_status("weird-token", 500)
-        r = client.get("/watch/auth_mock_012/ticket", headers={"Authorization": "Bearer weird-token"})
-        assert r.status_code == 502, f"expected 502 (unexpected upstream status), got {r.status_code}"
-        ok("unrecognized Users/Me status -> 502, not silently treated as valid or invalid")
+def test_web_connect_no_ticket_rejected(client: TestClient, *_):
+    print("\n=== /watch with no ticket is rejected once GO has a livestream ===")
+    register_livestream(client, "auth_mock_002", owner_user_id=1)
+    with client.websocket_connect("/watch/auth_mock_002") as ws:
+        raw = ws.receive_bytes()
+        msg_type, payload = unpack_frame(raw)
+        assert msg_type == MSG_ERROR, f"expected ERROR, got type={msg_type}"
+        ok("no ticket param -> MSG_ERROR, connection rejected")
 
 
-def test_ticket_mint_malformed_200(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Ticket mint: malformed 200 bodies fail loudly, never mint silently ===")
-    with open_source(client, "auth_mock_017", "Host17"):
-        fake_http.set_token_status("list-body-token", 200, body=[{"user_id": 1}])
-        r = client.get("/watch/auth_mock_017/ticket", headers={"Authorization": "Bearer list-body-token"})
-        assert r.status_code == 502, f"expected 502 for non-object body, got {r.status_code}"
-        ok("200 with a non-object body -> 502")
-
-        fake_http.set_token_status("no-id-token", 200, body={"display_name": "Ghost"})
-        r = client.get("/watch/auth_mock_017/ticket", headers={"Authorization": "Bearer no-id-token"})
-        assert r.status_code == 502, f"expected 502 for missing user_id, got {r.status_code}"
-        ok("200 missing user_id -> 502")
-
-        fake_http.set_token_status("str-id-token", 200, body={"user_id": "not-an-int", "display_name": "X"})
-        r = client.get("/watch/auth_mock_017/ticket", headers={"Authorization": "Bearer str-id-token"})
-        assert r.status_code == 502, f"expected 502 for non-int user_id, got {r.status_code}"
-        ok("200 with a string user_id -> 502")
-
-
-def test_watch_requires_ticket_when_auth_on(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== /watch requires a ticket once REQUIRE_WATCH_AUTH is on ===")
-    with open_source(client, "auth_mock_003", "Host3"):
-        server.REQUIRE_WATCH_AUTH = True
-        try:
-            with client.websocket_connect("/watch/auth_mock_003") as ws:
-                raw = ws.receive_bytes()
-                msg_type, payload = unpack_frame(raw)
-                assert msg_type == MSG_ERROR, f"expected ERROR with no ticket, got type={msg_type}"
-                ok("no ticket param -> MSG_ERROR, connection rejected")
-        finally:
-            server.REQUIRE_WATCH_AUTH = False
-
-
-def test_watch_admits_with_valid_ticket(client: TestClient, fake_http: FakeHTTPClient):
+def test_web_connect_valid_ticket_admits(client: TestClient, *_):
     print("\n=== /watch admits a connection carrying a valid ticket ===")
-    with open_source(client, "auth_mock_004", "Host4"):
-        fake_http.set_valid_token("good-token-4", user_id=99, display_name="Bob")
-        r = client.get("/watch/auth_mock_004/ticket", headers={"Authorization": "Bearer good-token-4"})
-        assert r.status_code == 200
-        ticket_key = r.json()["url"].split("ticket=")[1]
-
-        server.REQUIRE_WATCH_AUTH = True
-        try:
-            with client.websocket_connect(f"/watch/auth_mock_004?ticket={ticket_key}") as ws:
-                receive_until(ws, MSG_HEADER)
-                ok("valid ticket -> admitted, HEADER received")
-        finally:
-            server.REQUIRE_WATCH_AUTH = False
+    register_livestream(client, "auth_mock_003", owner_user_id=1)
+    ticket = mint_watch_ticket(client, "auth_mock_003", user_id=99)
+    with open_source(client, "auth_mock_003", "Host3", mint_stream_token(client, "auth_mock_003", 1)):
+        with client.websocket_connect(f"/watch/auth_mock_003?ticket={ticket}") as ws:
+            receive_until(ws, MSG_HEADER)
+            ok("valid ticket -> admitted, HEADER received")
 
 
-def test_ticket_is_single_use(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== A consumed ticket cannot be reused ===")
-    with open_source(client, "auth_mock_005", "Host5"):
-        fake_http.set_valid_token("good-token-5", user_id=7, display_name="Carol")
-        r = client.get("/watch/auth_mock_005/ticket", headers={"Authorization": "Bearer good-token-5"})
-        ticket_key = r.json()["url"].split("ticket=")[1]
+def test_watch_ticket_single_use(client: TestClient, *_):
+    print("\n=== A consumed watch ticket cannot be reused ===")
+    register_livestream(client, "auth_mock_004", owner_user_id=1)
+    ticket = mint_watch_ticket(client, "auth_mock_004", user_id=7)
+    with open_source(client, "auth_mock_004", "Host4", mint_stream_token(client, "auth_mock_004", 1)):
+        with client.websocket_connect(f"/watch/auth_mock_004?ticket={ticket}") as ws:
+            receive_until(ws, MSG_HEADER)
+        ok("first use of the ticket succeeds")
 
-        server.REQUIRE_WATCH_AUTH = True
-        try:
-            with client.websocket_connect(f"/watch/auth_mock_005?ticket={ticket_key}") as ws:
-                receive_until(ws, MSG_HEADER)
-            ok("first use of the ticket succeeds")
-
-            with client.websocket_connect(f"/watch/auth_mock_005?ticket={ticket_key}") as ws:
-                raw = ws.receive_bytes()
-                msg_type, payload = unpack_frame(raw)
-                assert msg_type == MSG_ERROR, f"expected ERROR on reuse, got type={msg_type}"
-            ok("second use of the same ticket -> rejected (single-use enforced)")
-        finally:
-            server.REQUIRE_WATCH_AUTH = False
+        with client.websocket_connect(f"/watch/auth_mock_004?ticket={ticket}") as ws:
+            raw = ws.receive_bytes()
+            msg_type, payload = unpack_frame(raw)
+            assert msg_type == MSG_ERROR, f"expected ERROR on reuse, got type={msg_type}"
+        ok("second use of the same ticket -> rejected (single-use enforced)")
 
 
-def test_ticket_wrong_lobby_rejected(client: TestClient, fake_http: FakeHTTPClient):
+def test_watch_ticket_wrong_lobby_rejected(client: TestClient, *_):
     print("\n=== A ticket minted for one lobby doesn't work on another ===")
-    with open_source(client, "auth_mock_006", "Host6"), \
-         open_source(client, "auth_mock_007", "Host7"):
-        fake_http.set_valid_token("good-token-6", user_id=11, display_name="Dave")
-        r = client.get("/watch/auth_mock_006/ticket", headers={"Authorization": "Bearer good-token-6"})
-        ticket_key = r.json()["url"].split("ticket=")[1]
+    register_livestream(client, "auth_mock_005", owner_user_id=1)
+    register_livestream(client, "auth_mock_006", owner_user_id=1)
+    ticket = mint_watch_ticket(client, "auth_mock_005", user_id=11)
 
-        server.REQUIRE_WATCH_AUTH = True
-        try:
-            with client.websocket_connect(f"/watch/auth_mock_007?ticket={ticket_key}") as ws:
-                raw = ws.receive_bytes()
-                msg_type, payload = unpack_frame(raw)
-                assert msg_type == MSG_ERROR, f"expected ERROR for cross-lobby ticket, got type={msg_type}"
-            ok("ticket minted for auth_mock_006 rejected on auth_mock_007")
-        finally:
-            server.REQUIRE_WATCH_AUTH = False
+    with open_source(client, "auth_mock_005", "Host5", mint_stream_token(client, "auth_mock_005", 1)), \
+         open_source(client, "auth_mock_006", "Host6", mint_stream_token(client, "auth_mock_006", 1)):
+        with client.websocket_connect(f"/watch/auth_mock_006?ticket={ticket}") as ws:
+            raw = ws.receive_bytes()
+            msg_type, payload = unpack_frame(raw)
+            assert msg_type == MSG_ERROR, f"expected ERROR for cross-lobby ticket, got type={msg_type}"
+        ok("ticket minted for auth_mock_005 rejected on auth_mock_006")
 
 
-def test_watch_reconnect_also_requires_ticket(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== /watch-reconnect enforces the same ticket check ===")
-    with open_source(client, "auth_mock_008", "Host8"):
-        server.REQUIRE_WATCH_AUTH = True
-        try:
-            with client.websocket_connect("/watch-reconnect/auth_mock_008") as ws:
-                raw = ws.receive_bytes()
-                msg_type, payload = unpack_frame(raw)
-                assert msg_type == MSG_ERROR, f"expected ERROR with no ticket, got type={msg_type}"
-            ok("watch-reconnect with no ticket -> MSG_ERROR (not silently bypassed)")
-        finally:
-            server.REQUIRE_WATCH_AUTH = False
+def test_watch_ticket_expired_rejected(client: TestClient, *_):
+    print("\n=== An expired ticket is rejected ===")
+    register_livestream(client, "auth_mock_007", owner_user_id=1)
+    ticket = mint_watch_ticket(client, "auth_mock_007", user_id=3)
+    server.watch_tickets[ticket]["expires_at"] = 1  # force expiry (1970) — contract no longer accepts it
+    with open_source(client, "auth_mock_007", "Host7", mint_stream_token(client, "auth_mock_007", 1)):
+        with client.websocket_connect(f"/watch/auth_mock_007?ticket={ticket}") as ws:
+            raw = ws.receive_bytes()
+            msg_type, payload = unpack_frame(raw)
+            assert msg_type == MSG_ERROR, f"expected ERROR for expired ticket, got type={msg_type}"
+        ok("expired ticket -> rejected")
 
 
-def test_watch_unaffected_when_auth_off(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Regression: /watch works with no ticket when REQUIRE_WATCH_AUTH is off ===")
-    with open_source(client, "auth_mock_009", "Host9"):
-        assert server.REQUIRE_WATCH_AUTH is False, "test order bug: a prior test left auth ON"
-        with client.websocket_connect("/watch/auth_mock_009") as ws:
-            receive_until(ws, MSG_HEADER)
-        ok("default (auth off) behavior unchanged")
+def test_stream_token_single_use(client: TestClient, *_):
+    print("\n=== A consumed stream token cannot be reused ===")
+    register_livestream(client, "auth_mock_008", owner_user_id=1)
+    token = mint_stream_token(client, "auth_mock_008", user_id=5)
+    with open_source(client, "auth_mock_008", "Host8", token):
+        pass
+    ok("first use of the stream token succeeds")
+
+    with client.websocket_connect(f"/stream/auth_mock_008?stream_token={token}") as ws:
+        raw = ws.receive_bytes()
+        msg_type, payload = unpack_frame(raw)
+        assert msg_type == MSG_ERROR, f"expected ERROR on reuse, got type={msg_type}"
+    ok("second use of the same stream token -> rejected (single-use enforced)")
 
 
-def test_self_view_block_on_rejects(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Self-view block: /watch from the streamer's own IP is rejected ===")
-    with open_source(client, "auth_mock_013", "Host13"):
-        server.ENABLE_SELF_VIEW_BLOCK = True
-        try:
-            with client.websocket_connect("/watch/auth_mock_013") as ws:
-                raw = ws.receive_bytes()
-                msg_type, payload = unpack_frame(raw)
-                assert msg_type == MSG_ERROR, f"expected ERROR, got type={msg_type}"
-                ok("observer with the source IP -> MSG_ERROR, connection closed")
-        finally:
-            server.ENABLE_SELF_VIEW_BLOCK = False
+def test_stream_token_expired_rejected(client: TestClient, *_):
+    print("\n=== An expired stream token is rejected ===")
+    register_livestream(client, "auth_mock_009", owner_user_id=1)
+    token = mint_stream_token(client, "auth_mock_009", user_id=6)
+    server.stream_tokens[token]["expires_at"] = 1  # force expiry (1970) — contract no longer accepts it
+    with client.websocket_connect(f"/stream/auth_mock_009?stream_token={token}") as ws:
+        raw = ws.receive_bytes()
+        msg_type, payload = unpack_frame(raw)
+        assert msg_type == MSG_ERROR, f"expected ERROR for expired token, got type={msg_type}"
+    ok("expired stream token -> rejected")
 
 
-def test_self_view_block_on_rejects_reconnect(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Self-view block: /watch-reconnect from the streamer's own IP is rejected ===")
-    with open_source(client, "auth_mock_014", "Host14"):
-        server.ENABLE_SELF_VIEW_BLOCK = True
-        try:
-            with client.websocket_connect("/watch-reconnect/auth_mock_014") as ws:
-                raw = ws.receive_bytes()
-                msg_type, payload = unpack_frame(raw)
-                assert msg_type == MSG_ERROR, f"expected ERROR, got type={msg_type}"
-                ok("reconnect with the source IP -> MSG_ERROR (no bypass via reconnect path)")
-        finally:
-            server.ENABLE_SELF_VIEW_BLOCK = False
+def test_stream_no_token_rejected(client: TestClient, *_):
+    print("\n=== /stream with no stream token is rejected ===")
+    register_livestream(client, "auth_mock_010", owner_user_id=1)
+    with client.websocket_connect("/stream/auth_mock_010") as ws:
+        raw = ws.receive_bytes()
+        msg_type, payload = unpack_frame(raw)
+        assert msg_type == MSG_ERROR, f"expected ERROR with no token, got type={msg_type}"
+    ok("no stream_token -> MSG_ERROR")
 
 
-def test_self_view_block_off_allows(client: TestClient, fake_http: FakeHTTPClient):
-    print("\n=== Regression: /watch works from the source IP when ENABLE_SELF_VIEW_BLOCK is off ===")
-    with open_source(client, "auth_mock_015", "Host15"):
-        assert server.ENABLE_SELF_VIEW_BLOCK is False, "test order bug: a prior test left the block ON"
-        with client.websocket_connect("/watch/auth_mock_015") as ws:
-            receive_until(ws, MSG_HEADER)
-        ok("default (self-view block off) behavior unchanged")
+def test_health_open(client: TestClient, *_):
+    print("\n=== /health stays unauthenticated ===")
+    r = client.get("/health")
+    assert r.status_code == 200, f"expected 200, got {r.status_code}"
+    ok("GET /health -> 200")
+
+
+def test_removed_endpoints_gone(client: TestClient, *_):
+    print("\n=== Retired endpoints are no longer served ===")
+    r = client.get("/games")
+    assert r.status_code in (404, 405), f"expected /games gone, got {r.status_code}"
+    ok("GET /games removed")
+
+    r = client.get("/watch/auth_mock_011/ticket", headers=keys())
+    assert r.status_code in (404, 405), f"expected ticket endpoint gone, got {r.status_code}"
+    ok("GET /watch/{id}/ticket removed")
+
+    register_livestream(client, "auth_mock_011", owner_user_id=1)
+    try:
+        with client.websocket_connect("/watch-reconnect/auth_mock_011") as ws:
+            ws.receive_bytes()
+        ok("/watch-reconnect removed (route gone, no admission)")
+    except WebSocketDisconnect:
+        ok("/watch-reconnect removed (route gone, connection rejected)")
+    except Exception as e:
+        ok(f"/watch-reconnect removed (route gone, got {type(e).__name__})")
+
+
+def test_delete_livestream_ends_session(client: TestClient, *_):
+    print("\n=== DELETE /internal/livestreams/{id} ends the session ===")
+    register_livestream(client, "auth_mock_012", owner_user_id=1)
+    token = mint_stream_token(client, "auth_mock_012", user_id=2)
+    ticket = mint_watch_ticket(client, "auth_mock_012", user_id=3)
+    assert "auth_mock_012" in server.games
+
+    r = client.delete("/internal/livestreams/auth_mock_012", headers=keys())
+    assert r.status_code == 200, f"expected 200, got {r.status_code}: {r.text}"
+    assert "auth_mock_012" not in server.games
+    ok("DELETE ends and reaps the session")
+
+    r = client.delete("/internal/livestreams/auth_mock_012", headers=keys())
+    assert r.status_code == 404, f"expected 404 on second delete, got {r.status_code}"
+    ok("DELETE of unknown lobby -> 404")
+
+    with client.websocket_connect(f"/watch/auth_mock_012?ticket={ticket}") as ws:
+        raw = ws.receive_bytes()
+        msg_type, payload = unpack_frame(raw)
+        assert msg_type == MSG_ERROR, f"expected ERROR (game ended), got type={msg_type}"
+    ok("watch on ended game -> MSG_ERROR")
+
+
+def test_ticket_gets_configured_ttl(client: TestClient, *_):
+    print("\n=== Minted credential gets WATCH_TICKET_TTL_SECONDS (no expires_at in contract) ===")
+    register_livestream(client, "auth_mock_013", owner_user_id=1)
+    ticket = mint_watch_ticket(client, "auth_mock_013", user_id=4)
+    cred = server.watch_tickets.get(ticket)
+    assert cred is not None, "ticket not stored"
+    expected = server.time.time() + server.WATCH_TICKET_TTL_SECONDS
+    assert abs(cred["expires_at"] - expected) < 2, f"expiry wrong: {cred['expires_at']}"
+    ok("credential expiry = now + WATCH_TICKET_TTL_SECONDS")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -355,45 +338,36 @@ def test_self_view_block_off_allows(client: TestClient, fake_http: FakeHTTPClien
 
 def main():
     print("=" * 60)
-    print("RELAY WATCH-TICKET AUTH TESTS (mocked GO Users/Me, in-process, no real sockets)")
+    print("RELAY GO-ORCHESTRATED TICKET TESTS (mocked GO caller, in-process, no real sockets)")
     print("=" * 60)
 
-    with TestClient(server.app) as client:
-        # Overwrite what the app's startup handler set (a real aiohttp.ClientSession) with our
-        # fake — must happen after entering the context, since __enter__ runs the lifespan.
-        # The real session is never used and would otherwise leak (and warn on exit), so it
-        # gets closed here rather than just dropped.
-        real_session = server.http_client
-        fake_http = FakeHTTPClient()
-        server.http_client = fake_http
-        if real_session is not None:
-            client.portal.call(real_session.close)
+    server.INTERNAL_API_KEY = RELAY_KEY
 
+    with TestClient(server.app) as client:
         tests = [
-            test_ticket_mint_valid_token,
-            test_ticket_mint_invalid_token,
-            test_ticket_mint_banned_user,
-            test_ticket_mint_deleted_user,
-            test_ticket_mint_unexpected_status,
-            test_ticket_mint_malformed_200,
-            test_watch_requires_ticket_when_auth_on,
-            test_watch_admits_with_valid_ticket,
-            test_ticket_is_single_use,
-            test_ticket_wrong_lobby_rejected,
-            test_watch_reconnect_also_requires_ticket,
-            test_watch_unaffected_when_auth_off,
-            test_self_view_block_on_rejects,
-            test_self_view_block_on_rejects_reconnect,
-            test_self_view_block_off_allows,
+            test_internal_key_required,
+            test_livestream_register_and_base_url,
+            test_stream_token_unknown_lobby,
+            test_watch_ticket_unknown_lobby,
+            test_web_connect_no_ticket_rejected,
+            test_web_connect_valid_ticket_admits,
+            test_watch_ticket_single_use,
+            test_watch_ticket_wrong_lobby_rejected,
+            test_watch_ticket_expired_rejected,
+            test_stream_token_single_use,
+            test_stream_token_expired_rejected,
+            test_stream_no_token_rejected,
+            test_health_open,
+            test_removed_endpoints_gone,
+            test_delete_livestream_ends_session,
+            test_ticket_gets_configured_ttl,
         ]
 
         for test in tests:
             try:
-                test(client, fake_http)
+                test(client, None)
             except Exception as e:
                 fail(test.__name__, str(e))
-                server.REQUIRE_WATCH_AUTH = False  # don't let a failed test leak state
-                server.ENABLE_SELF_VIEW_BLOCK = False
 
     print("\n" + "=" * 60)
     print(f"RESULTS: {PASS} passed, {FAIL} failed")

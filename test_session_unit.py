@@ -9,9 +9,6 @@ replay file: observers write each BODY chunk at its absolute file offset, so a c
 delivered out of order leaves a hole, and a chunk delivered twice rewinds the client's
 parse cursor.
 
-The invariant both scenarios check is the same: across catch-up and live broadcast, every
-body byte reaches the observer exactly once, in order, with no gap and no overlap.
-
 Run: python test_session_unit.py
 """
 import asyncio
@@ -137,70 +134,9 @@ async def test_append_then_join():
     check_exactly_once("body delivered exactly once", ws, INITIAL_BODY + LIVE_CHUNK)
 
 
-async def test_games_payload():
-    """/games must carry what the in-game observer browser renders."""
-    print("\ntest_games_payload")
-    session = new_session()
-    session.lobby = {
-        "lobbytype": 0,
-        "region": "USWest",
-        "rngseed": 1234,
-        "mapname": "Tournament Desert",
-        "mappath": "",
-        "name": "Dennis's Game",
-        "owner": 1,
-        "members": [
-            {"userid": 1, "displayname": "Dennis"},
-            {"userid": 2, "displayname": "Opponent"},
-            {"userid": -1, "displayname": ""},
-        ],
-    }
-
-    saved = dict(server.games)
-    server.games.clear()
-    server.games["unittest"] = session
-    try:
-        rows = await server.list_games()
-    finally:
-        server.games.clear()
-        server.games.update(saved)
-
-    check("one row returned", len(rows) == 1, f"rows={rows}")
-    row = rows[0]
-    for key in ("lobbyid", "mapname", "name", "members", "viewers", "sources",
-                "delay_seconds", "age_seconds"):
-        check(f"row has {key}", key in row, f"row={row}")
-    check("lobbyid populated", row.get("lobbyid") == "unittest", f"row={row}")
-    check("map populated", row.get("mapname") == "Tournament Desert", f"row={row}")
-    occupied = [m.get("displayname") for m in row.get("members", []) if m.get("userid", -1) != -1]
-    check("players populated", occupied == ["Dennis", "Opponent"], f"row={row}")
-    check("delay forwarded", row.get("delay_seconds") == DELAY_SECONDS, f"row={row}")
-    check("age is a non-negative int",
-          isinstance(row.get("age_seconds"), int) and row["age_seconds"] >= 0, f"row={row}")
-
-
-async def test_ended_games_hidden():
-    print("\ntest_ended_games_hidden")
-    session = new_session()
-    session.ended = True
-
-    saved = dict(server.games)
-    server.games.clear()
-    server.games["unittest"] = session
-    try:
-        rows = await server.list_games()
-    finally:
-        server.games.clear()
-        server.games.update(saved)
-
-    check("ended games excluded", rows == [], f"rows={rows}")
-
-
 async def main():
     await test_join_then_append()
     await test_append_then_join()
-    await test_games_payload()
-    await test_ended_games_hidden()
 
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
