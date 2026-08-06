@@ -5,7 +5,8 @@ Architecture: GO Services → Relay → Observer/Streamer
 GO services validates user JWTs and calls this relay over HTTP with a shared
 INTERNAL_API_KEY to mint single-use stream tokens (streamers) and watch tickets
 (observers). This relay never sees a user JWT; it only trusts GO. See
-plans/relay-go-orchestrated-livestreams.md for the full design.
+plans/archive/relay-go-orchestrated-livestreams.md for the original design (parts of it
+are superseded; docs/running-the-stack.md is current).
 
 WebSocket-based relay with binary envelope protocol (msg types 0-6).
 Aligned with the C++ LiveStreamer/LiveObserver client (libcurl websockets).
@@ -61,7 +62,7 @@ BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "256"))
 # Verbose per-game / per-connection logging. Enable with DEBUG=1 (or "true"/"yes"/"on").
 DEBUG = os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
-# ── GO-orchestration config (plans/relay-go-orchestrated-livestreams.md) ────
+# ── GO-orchestration config (see docs/running-the-stack.md) ─────────────────
 # Shared secret GO services sends as X-Relay-Key on every /internal/* call. Without it the
 # internal endpoints refuse to serve (503), so a misconfigured deploy fails loudly instead of
 # accepting unauthenticated mint requests. This is GO's credential to this relay — the relay
