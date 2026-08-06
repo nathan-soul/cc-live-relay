@@ -213,9 +213,20 @@ async def observe(go_http: str, session_token: str, lobby_id: int) -> str:
             return data.get("url")
 
 
+def rewrite_relay_host(url: str, relay_host: str) -> str:
+    """Point a relay URL minted by GO at the given relay host.
+
+    GO mints stream/watch URLs from PUBLIC_HOST (default localhost), which may not be reachable
+    from the test machine (a stale local listener, IPv6 resolution, etc.). Rewrite only the
+    authority (host[:port]) so the path/query — the part the relay routes on — is untouched.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, relay_host, parts.path, parts.query, parts.fragment))
+
+
 async def stream_replay(relay_ws_url: str):
     """Connect as streamer to relay /stream, push HEADER + BODY."""
-    relay_ws_url = relay_ws_url.replace("localhost", "127.0.0.1")
     ws = await websockets.connect(relay_ws_url, open_timeout=10, ping_interval=20)
     # REGISTER frame
     await ws.send(pack_frame(MSG_REGISTER, json.dumps({
@@ -265,6 +276,12 @@ async def main():
     ap.add_argument("--relay", default="ws://127.0.0.1:8765")
     args = ap.parse_args()
 
+    # The relay host:port the test can actually reach (from --relay). GO mints stream/watch
+    # URLs using its PUBLIC_HOST, which defaults to "localhost" — reachable in a normal Docker
+    # setup but shadowable by a stale local listener. Rewriting to this host keeps the test
+    # portable.
+    relay_host = args.relay.split("://", 1)[-1].split("/", 1)[0]
+
     print("=" * 60)
     print("FULL-STACK LIVESTREAM TEST (GO + relay over real sockets)")
     print("=" * 60)
@@ -308,7 +325,7 @@ async def main():
        f"livestreams list does NOT contain {lobby_id}: {livestreams}")
 
     # 6. Streamer connects to relay
-    streamer_ws = await stream_replay(stream_url)
+    streamer_ws = await stream_replay(rewrite_relay_host(stream_url, relay_host))
 
     # 7. Second user (observer) logs in + observes
     login_b = await check_login(args.go)
@@ -319,7 +336,7 @@ async def main():
     ok(f"observe returned watch url={watch_url}")
 
     # 8. Observer connects to relay
-    observer_ws = await watch_replay(watch_url)
+    observer_ws = await watch_replay(rewrite_relay_host(watch_url, relay_host))
 
     # 9. End the stream, cleanup
     await streamer_ws.send(pack_frame(MSG_END, b""))

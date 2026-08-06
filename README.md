@@ -61,7 +61,9 @@ Via environment variables:
 | `INTERNAL_API_KEY` | (none) | **GO's credential** to call this relay: GO sends this as `X-Relay-Key` on every `/internal/*` call (matches GO's `Relay.api_key`). Without it the internal endpoints refuse all calls (503) |
 | `GO_API_KEY` | (none) | **The relay's own credential** for outbound calls to GO (the stream-ended notification), sent as `X-Relay-Key` (matches GO's `Relay.ingress_api_key`). Distinct from `INTERNAL_API_KEY` so each side has its own secret |
 | `WATCH_TICKET_TTL_SECONDS` | `30` | Lifetime for a minted credential. GO does not send an expiry — the client mints and connects immediately, so a short fixed window is plenty (and keeps the stolen-ticket replay window small). On reconnect, a fresh ticket is minted |
-| `GO_STREAM_ENDED_URL` | (none) | Optional. Where the relay POSTs `{lobby_id, reason}` when it closes a stream (last source gone / inactivity reap). Sent with `GO_API_KEY` as `X-Relay-Key`. Empty = relay never notifies GO |
+| `GO_OBSERVERS_URL` | (none) | Optional. Where the relay POSTs the batched livestream state: `[{"lobby_id": "...", "observer_count": n, "is_live": bool}, ...]` for every lobby whose observer count changed or whose stream ended. Sent with `GO_API_KEY` as `X-Relay-Key`. Empty = relay never reports to GO |
+| `OBSERVER_UPDATE_INTERVAL` | `60` | Seconds between periodic observer-count reports to GO for every active game, as a baseline even when nobody joins/leaves |
+| `OBSERVER_CHANGE_TIMEOUT` | `15` | Seconds after the first observer join/leave before the relay posts the count to GO. Changes that arrive before the timer fires are batched into that single post — the timer is never reset, so the report always goes out `OBSERVER_CHANGE_TIMEOUT` seconds after the first change. The count is a rough estimate, not per-event liveness |
 | `PUBLIC_HOST` | (request host) | Public host used when building connect URLs, if the request's own Host header isn't right |
 | `PUBLIC_WS_SCHEME` | `wss` | Scheme used when building the connect URLs |
 
@@ -104,6 +106,25 @@ the same host/port, only differing by path.
 | `WS /stream/{lobbyid}?stream_token=KEY` | WebSocket | Streamer connects with a single-use stream token, then sends REGISTER/HEADER/PATCH/BODY/END frames |
 | `WS /watch/{lobbyid}?ticket=KEY` | WebSocket | Observer watches a game (catch-up + live stream) with a single-use watch ticket |
 
+### Livestream state to GO
+
+The relay is the only party that knows who is actually connected as a spectator and when a
+stream truly closed, so it reports a **rough estimate** of that state to GO rather than
+per-event liveness. Every observer join/leave (including a dead-socket sweep) marks that
+lobby dirty; the first change arms a timer, and any further changes before it fires are
+batched into the same post (the timer is never reset). When it fires, **all** dirty lobbies
+are sent to GO in a single request:
+
+```json
+[{"lobby_id": "123", "observer_count": 4, "is_live": true}]
+```
+
+A lobby whose stream ended (last source gone / END / inactivity reap / DELETE) is sent with
+`is_live: false` and a count of `0`, which is how GO stops listing it — there is no separate
+"stream ended" notification. Separately, every `OBSERVER_UPDATE_INTERVAL` seconds the same
+dirty sets are flushed as a baseline, so a static stream's count never goes stale. Lobbies
+whose count is unchanged from the last posted value are skipped.
+
 ### Retired endpoints
 `GET /games`, `GET /debug/body/{lobbyid}`, `GET /watch/{lobbyid}/ticket`,
 `WS /register` and `WS /watch-reconnect/{lobbyid}` are removed — the live-games menu and
@@ -124,6 +145,9 @@ python test_relay_auth_mock.py
 
 # GameSession delivery semantics, no server required:
 python test_session_unit.py
+
+# Observer-count reporting (debounce + periodic), no server required:
+python test_observer_report.py
 ```
 
 ## Development

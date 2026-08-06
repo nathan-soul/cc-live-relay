@@ -70,25 +70,37 @@ WATCH_TICKET_TTL_SECONDS = int(os.getenv("WATCH_TICKET_TTL_SECONDS", "30"))
 # (no untrusted reverse proxy in front of it). Set PUBLIC_HOST explicitly if that changes.
 PUBLIC_HOST = os.getenv("PUBLIC_HOST", "")
 PUBLIC_WS_SCHEME = os.getenv("PUBLIC_WS_SCHEME", "wss")
+# Optional path prefix on the public URLs the relay hands to clients, for when the relay is
+# served behind a reverse proxy under a sub-path rather than a dedicated hostname — e.g.
+# `wss://batty.youbantoo.club/relay/stream/...` when Traefik routes `/relay/*` to this relay.
+# The relay's own WS routes (/stream, /watch) are NOT prefixed; the reverse proxy strips the
+# prefix before forwarding, and this value only makes the minted connect URLs match the
+# public path. Empty by default (no prefix).
+PUBLIC_PATH_PREFIX = os.getenv("PUBLIC_PATH_PREFIX", "")
 
-# Where GO services receives the relay's "this livestream ended" notification. The relay
-# owns closing a stream (it observes the last source leave / END / inactivity reaping), so
-# when it closes a session it reports back here rather than waiting for GO to ask. Optional:
-# empty means the relay runs without notifying GO (the session still closes either way).
-# The relay's own credential (GO_API_KEY, distinct from INTERNAL_API_KEY) is sent as
-# X-Relay-Key so GO can authenticate it — GO holds that same value as Relay.ingress_api_key.
-GO_STREAM_ENDED_URL = os.getenv("GO_STREAM_ENDED_URL", "")
-# The relay's own secret for outbound calls to GO (currently only the stream-ended
+# The relay's own secret for outbound calls to GO (the batched livestream-progress
 # notification). Distinct from INTERNAL_API_KEY by design: each side has its own credential,
 # so compromising one side does not reveal the key the other side uses. GO stores the same
 # value as Relay.ingress_api_key.
 GO_API_KEY = os.getenv("GO_API_KEY", "")
+# Where GO services receives the relay's batched livestream-progress updates (POST /observers):
+# an array of {lobby_id, observer_count, is_live} entries. The relay is the only party that
+# knows who is actually connected as an observer and when a stream truly closed, so it reports
+# a rough, coalesced snapshot here rather than per-event liveness. Optional: empty means the
+# relay never reports to GO. Authenticated with GO_API_KEY as X-Relay-Key.
+GO_OBSERVERS_URL = os.getenv("GO_OBSERVERS_URL", "")
+# How often (seconds) the relay pushes each active game's observer count to GO, as a baseline
+# even when nothing changed.
+OBSERVER_UPDATE_INTERVAL = int(os.getenv("OBSERVER_UPDATE_INTERVAL", "60"))
+# Window (seconds) after the first observer join/leave (or a stream ending) before the relay
+# posts the batch to GO. Changes that arrive before the timer fires are coalesced into that
+# same post; the timer is never reset. The count is a rough estimate -- not live, not per-event.
+OBSERVER_CHANGE_TIMEOUT = int(os.getenv("OBSERVER_CHANGE_TIMEOUT", "15"))
 
 # Shared outbound HTTP session for GO notifications. Created once at first use and reused for
-# every stream-ended POST, so the TLS/TCP setup cost is paid once per process instead of once
-# per stream end (the old code kept a shared http_client at startup for the same reason — see
-# start_cleanup_task / stop_http_client). Guarded by the asyncio event loop, which runs single-
-# threaded, so lazy creation here is race-free.
+# every livestream-progress POST, so the TLS/TCP setup cost is paid once per process instead of
+# once per stream. Guarded by the asyncio event loop, which runs single-threaded, so lazy
+# creation here is race-free.
 _go_notify_session: Optional[aiohttp.ClientSession] = None
 
 
@@ -130,6 +142,18 @@ def unpack_frame(data: bytes) -> tuple:
     if len(data) < 5 + payload_len:
         return (None, b"")
     return (msg_type, data[5:5 + payload_len])
+
+
+async def reject(websocket: WebSocket, message: str) -> None:
+    """Send an MSG_ERROR frame and close the WebSocket — the common admission-failure path."""
+    try:
+        await websocket.send_bytes(pack_frame(MSG_ERROR, message.encode()))
+    except Exception:
+        pass
+    try:
+        await websocket.close()
+    except Exception:
+        pass
 
 
 # ── GO-shaped lobby metadata ───────────────────────────────────────────────
@@ -212,6 +236,8 @@ class GameSession:
         self._lock = asyncio.Lock()
         self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
         self._observer_catchup_limit: dict[WebSocket, int] = {}
+        # Last count actually posted to GO, so unchanged sessions skip redundant posts.
+        self._last_reported_observers: Optional[int] = None
 
     # ── Data ingestion (called from source loop) ─────────────────────────
 
@@ -330,12 +356,12 @@ class GameSession:
             self.save_replay()
             await self._broadcast_envelope(MSG_END, b'')
         # The relay owns closing a stream: when it observes the last source leave (with or
-        # without END), it reports the end to GO so GO stops listing the livestream. This is
-        # the primary teardown signal — GO's DELETE /internal/livestreams is only a fallback
-        # for cases the relay cannot observe (e.g. GO knows the match ended before the last
-        # source disconnected).
+        # without END), it flags the stream ended so the next batch tells GO to stop listing
+        # the livestream. This is the primary teardown signal — GO's DELETE
+        # /internal/livestreams is only a fallback for cases the relay cannot observe (e.g.
+        # GO knows the match ended before the last source disconnected).
         if ended_here:
-            await notify_stream_ended(self.lobby_id, "all sources gone")
+            mark_stream_ended(self.lobby_id)
 
     # ── Observer lifecycle ───────────────────────────────────────────────
 
@@ -365,6 +391,7 @@ class GameSession:
             self._observer_catchup_limit[ws] = len(self.body)
             self.observer_ws_set.add(ws)
             self.last_active = time.time()
+            mark_observer_change(self.lobby_id)
             return send_lock
 
     async def remove_observer(self, ws: WebSocket) -> None:
@@ -372,6 +399,7 @@ class GameSession:
             self.observer_ws_set.discard(ws)
             self._observer_send_locks.pop(ws, None)
             self._observer_catchup_limit.pop(ws, None)
+        mark_observer_change(self.lobby_id)
 
     async def send_catchup(self, ws: WebSocket, last_offset: int = 0,
                            held_lock: Optional[asyncio.Lock] = None) -> None:
@@ -465,6 +493,9 @@ class GameSession:
                 self._observer_send_locks.pop(ws, None)
                 self._observer_catchup_limit.pop(ws, None)
 
+        if dead:
+            mark_observer_change(self.lobby_id)
+
 
 # ── In-memory state ────────────────────────────────────────────────────────
 games: dict[str, GameSession] = {}
@@ -521,26 +552,120 @@ def _get_go_notify_session() -> aiohttp.ClientSession:
     return _go_notify_session
 
 
-async def notify_stream_ended(lobby_id: str, reason: str) -> None:
-    """Tell GO services a livestream has ended, so it can stop listing it.
+# Lobbies whose GO-visible state changed since the last report, split by what changed:
+#   _observer_dirty: the observer count changed (report current count, is_live=True)
+#   _ended_dirty:    the stream closed (report is_live=False, count 0)
+# A single shared timer drains both into one batched request to GO. The state is a rough
+# estimate — never per-event liveness — so batching every change since the last send is correct.
+_observer_dirty: set[str] = set()
+_ended_dirty: set[str] = set()
+_observer_batch_task: Optional[asyncio.Task] = None
 
-    Fire-and-forget and never raises: GO being down or unreachable must not affect the
-    relay's own teardown. Authenticates with the relay's own key (GO_API_KEY) as
-    X-Relay-Key, which GO validates against Relay.ingress_api_key.
+
+def _arm_observer_batch() -> None:
+    """Start the shared batch timer if one is not already pending (never reset it)."""
+    global _observer_batch_task
+    if _observer_batch_task is not None and not _observer_batch_task.done():
+        return
+
+    async def _flush_later() -> None:
+        try:
+            await asyncio.sleep(OBSERVER_CHANGE_TIMEOUT)
+        except asyncio.CancelledError:
+            return
+        global _observer_batch_task
+        _observer_batch_task = None
+        await flush_observer_batch()
+
+    _observer_batch_task = asyncio.create_task(_flush_later())
+
+
+def mark_observer_change(lobby_id: str) -> None:
+    """Record that a lobby's observer set changed and arm the shared batch timer.
+
+    Called on every observer join/leave (including the dead-socket sweep). The first change
+    arms a single OBSERVER_CHANGE_TIMEOUT timer; changes that arrive before it fires are added
+    to the same batch, and the timer is never reset — the batch always goes out
+    OBSERVER_CHANGE_TIMEOUT seconds after the first change. No-op if GO reporting is disabled.
     """
-    if not GO_STREAM_ENDED_URL:
+    if not GO_OBSERVERS_URL:
+        return
+    _observer_dirty.add(lobby_id)
+    _arm_observer_batch()
+
+
+def mark_stream_ended(lobby_id: str) -> None:
+    """Record that a lobby's stream closed and arm the shared batch timer.
+
+    The relay owns stream liveness (it observes the last source leave / END / inactivity
+    reaping), so when it closes a session it flags the lobby for an is_live=False report
+    rather than maintaining a separate ended notification path. No-op if GO reporting is
+    disabled.
+    """
+    if not GO_OBSERVERS_URL:
+        return
+    _ended_dirty.add(lobby_id)
+    _observer_dirty.discard(lobby_id)
+    _arm_observer_batch()
+
+
+async def flush_observer_batch() -> None:
+    """Post every dirty lobby's livestream state to GO in a single request.
+
+    Ended lobbies are reported with is_live=False and a count of 0. Live lobbies are reported
+    with their current count at flush time (so all changes since the last send are reflected)
+    and is_live=True; those whose count is unchanged from the last posted value are skipped.
+    No-op when nothing is dirty or reporting is disabled.
+    """
+    if not GO_OBSERVERS_URL or (not _observer_dirty and not _ended_dirty):
+        return
+
+    entries = []
+
+    for lobby_id in list(_ended_dirty):
+        entries.append({"lobby_id": str(lobby_id), "observer_count": 0, "is_live": False})
+    _ended_dirty.clear()
+
+    for lobby_id in list(_observer_dirty):
+        session = games.get(lobby_id)
+        if session is None or session.ended:
+            _observer_dirty.discard(lobby_id)
+            continue
+        count = len(session.observer_ws_set)
+        if count == session._last_reported_observers:
+            _observer_dirty.discard(lobby_id)
+            continue
+        session._last_reported_observers = count
+        entries.append({"lobby_id": str(lobby_id), "observer_count": count, "is_live": True})
+
+    if not entries:
+        _observer_dirty.clear()
+        return
+
+    await notify_lobby_progress(entries)
+    _observer_dirty.clear()
+
+
+async def notify_lobby_progress(entries: list) -> None:
+    """Tell GO services the current livestream state for a set of lobbies.
+
+    Fire-and-forget and never raises: GO being down or unreachable must not affect the relay's
+    own streaming. Authenticates with the relay's own key (GO_API_KEY) as X-Relay-Key, which GO
+    validates against Relay.ingress_api_key.
+    """
+    if not GO_OBSERVERS_URL or not entries:
         return
     try:
         async with _get_go_notify_session().post(
-            GO_STREAM_ENDED_URL,
-            json={"lobby_id": str(lobby_id), "reason": reason},
+            GO_OBSERVERS_URL,
+            json=entries,
             headers={"X-Relay-Key": GO_API_KEY} if GO_API_KEY else {},
             timeout=aiohttp.ClientTimeout(total=5),
         ) as _:
             pass
-        log_debug(f"[LIVESTREAM] notified GO: {lobby_id} ended ({reason})")
+        log_debug(f"[LIVESTREAM] notified GO livestream state: {entries}")
     except Exception as e:
-        log_warn(f"[LIVESTREAM] [WARN] failed to notify GO for {lobby_id}: {type(e).__name__}: {e}")
+        log_warn(f"[LIVESTREAM] [WARN] failed to notify GO livestream state: {type(e).__name__}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -567,8 +692,22 @@ def _public_host(request: Request) -> str:
     return PUBLIC_HOST or (request.headers.get("host") or request.url.hostname)
 
 
+def _public_path_prefix() -> str:
+    """Normalized path prefix for public connect URLs (e.g. '/relay' or '')."""
+    prefix = PUBLIC_PATH_PREFIX.strip()
+    if not prefix:
+        return ""
+    if not prefix.startswith("/"):
+        prefix = "/" + prefix
+    return prefix.rstrip("/")
+
+
 def _public_base(request: Request, lobby_id: str) -> str:
-    return f"{PUBLIC_WS_SCHEME}://{_public_host(request)}/stream/{lobby_id}"
+    return f"{PUBLIC_WS_SCHEME}://{_public_host(request)}{_public_path_prefix()}/stream/{lobby_id}"
+
+
+def _public_ws_url(request: Request, url_path: str, lobby_id: str, query_param: str, key: str) -> str:
+    return f"{PUBLIC_WS_SCHEME}://{_public_host(request)}{_public_path_prefix()}/{url_path}/{lobby_id}?{query_param}={key}"
 
 
 async def _internal_payload(request: Request) -> dict:
@@ -592,13 +731,31 @@ def _require_live_session(lobby_id: str) -> None:
         raise HTTPException(status_code=404, detail="game not found or ended")
 
 
+def _get_or_create_session(lobby_id: str) -> GameSession:
+    """Return the live session for a lobby, creating a fresh one if none exists yet."""
+    session = games.get(lobby_id)
+    if session is None or session.ended:
+        session = GameSession(lobby_id)
+        games[lobby_id] = session
+    return session
+
+
 def _mint_credential(request: Request, lobby_id: str, body: dict,
                      store: dict, url_path: str, query_param: str) -> dict:
     """Mint a single-use credential and return its public connect URL."""
     user_id = body.get("user_id")
     key = _new_credential(lobby_id, user_id, store)
     log_debug(f"[TICKET] [INTERNAL] {query_param} minted for user_id={user_id} lobby={lobby_id}")
-    return {"url": f"{PUBLIC_WS_SCHEME}://{_public_host(request)}/{url_path}/{lobby_id}?{query_param}={key}"}
+    return {"url": _public_ws_url(request, url_path, lobby_id, query_param, key)}
+
+
+async def _mint_credential_for_lobby(request: Request, store: dict,
+                                     url_path: str, query_param: str) -> dict:
+    """Shared handler for /internal/stream_tokens and /internal/watch_tickets."""
+    body = await _internal_payload(request)
+    lobby_id = _require_lobby_id(body)
+    _require_live_session(lobby_id)
+    return _mint_credential(request, lobby_id, body, store, url_path, query_param)
 
 
 @app.post("/internal/livestreams")
@@ -607,10 +764,7 @@ async def internal_create_livestream(request: Request):
     body = await _internal_payload(request)
     lobby_id = _require_lobby_id(body)
 
-    session = games.get(lobby_id)
-    if session is None or session.ended:
-        session = GameSession(lobby_id)
-        games[lobby_id] = session
+    session = _get_or_create_session(lobby_id)
     session.owner_user_id = body.get("owner_user_id")
     log_debug(f"[TICKET] [INTERNAL] livestream registered for lobby={lobby_id}")
     return {"base_url": _public_base(request, lobby_id)}
@@ -619,19 +773,13 @@ async def internal_create_livestream(request: Request):
 @app.post("/internal/stream_tokens")
 async def internal_create_stream_token(request: Request):
     """Mint a single-use stream token for one lobby member (a streamer)."""
-    body = await _internal_payload(request)
-    lobby_id = _require_lobby_id(body)
-    _require_live_session(lobby_id)
-    return _mint_credential(request, lobby_id, body, stream_tokens, "stream", "stream_token")
+    return await _mint_credential_for_lobby(request, stream_tokens, "stream", "stream_token")
 
 
 @app.post("/internal/watch_tickets")
 async def internal_create_watch_ticket(request: Request):
     """Mint a single-use watch ticket for one observer of a livestream."""
-    body = await _internal_payload(request)
-    lobby_id = _require_lobby_id(body)
-    _require_live_session(lobby_id)
-    return _mint_credential(request, lobby_id, body, watch_tickets, "watch", "ticket")
+    return await _mint_credential_for_lobby(request, watch_tickets, "watch", "ticket")
 
 
 @app.delete("/internal/livestreams/{lobby_id}")
@@ -643,6 +791,7 @@ async def internal_delete_livestream(lobby_id: str, request: Request):
         raise HTTPException(status_code=404, detail="game not found")
     session.ended = True
     await session._broadcast_envelope(MSG_END, b'')
+    mark_stream_ended(lobby_id)
     games.pop(lobby_id, None)
     log_debug(f"[TICKET] [INTERNAL] livestream ended lobby={lobby_id}")
     return {"detail": "ok"}
@@ -684,24 +833,21 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
 
     token = websocket.query_params.get("stream_token")
     if consume_stream_token(token, lobby_id) is None:
-        await websocket.send_bytes(pack_frame(MSG_ERROR, b"Invalid or expired stream token"))
-        await websocket.close()
+        await reject(websocket, "Invalid or expired stream token")
         return
 
     try:
         # ── Receive REGISTER frame (binary) ────────────────────────────
         msg = await websocket.receive()
         if "bytes" not in msg:
-            await websocket.send_bytes(pack_frame(MSG_ERROR, b"Expected binary REGISTER frame"))
-            await websocket.close()
+            await reject(websocket, "Expected binary REGISTER frame")
             return
 
         raw_bytes = msg["bytes"]
         log_debug(f"[LIVESTREAMER] [REGISTER_RAW] {len(raw_bytes)} bytes: {raw_bytes[:80].hex()} ...")
         msg_type, payload = unpack_frame(raw_bytes)
         if msg_type != MSG_REGISTER or not payload:
-            await websocket.send_bytes(pack_frame(MSG_ERROR, b"Expected REGISTER message (type=0)"))
-            await websocket.close()
+            await reject(websocket, "Expected REGISTER message (type=0)")
             return
 
         reg_text = payload.decode("utf-8", errors="replace")
@@ -713,18 +859,14 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
         is_host = bool(reg.get("is_host", False))
 
         if not can_stream:
-            await websocket.send_bytes(pack_frame(MSG_ERROR, b"stream token valid, but can_stream required"))
-            await websocket.close()
+            await reject(websocket, "stream token valid, but can_stream required")
             return
 
         # ── Assign session ─────────────────────────────────────────────
         # The session is keyed by the URL lobby_id, which is GO's LobbyID (the value GO
         # minted the stream token for). A REGISTER payload carrying a different lobbyid is
         # ignored — the URL is the authority here.
-        session = games.get(lobby_id)
-        if session is None or session.ended:
-            session = GameSession(lobby_id)
-            games[lobby_id] = session
+        session = _get_or_create_session(lobby_id)
 
         # ── Host-authoritative fields ──────────────────────────────────
         if is_host:
@@ -819,20 +961,17 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
     # retry a ticket against a different lobby or an ended game.
     ticket = websocket.query_params.get("ticket")
     if consume_watch_ticket(ticket, lobby_id) is None:
-        await websocket.send_bytes(pack_frame(MSG_ERROR, b"Missing or invalid watch ticket"))
-        await websocket.close()
+        await reject(websocket, "Missing or invalid watch ticket")
         return
 
     session = games.get(lobby_id)
     if not session or session.ended:
-        await websocket.send_bytes(pack_frame(MSG_ERROR, b"Game not found or ended"))
-        await websocket.close()
+        await reject(websocket, "Game not found or ended")
         return
 
     send_lock = await session.add_observer(websocket)
     if send_lock is None:
-        await websocket.send_bytes(pack_frame(MSG_ERROR, b"Max observers reached"))
-        await websocket.close()
+        await reject(websocket, "Max observers reached")
         return
 
     log_debug(f"[OBSERVER] [WATCH] Observer connected to game {lobby_id} ({len(session.observer_ws_set)} viewers)")
@@ -865,6 +1004,7 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
 @app.on_event("startup")
 async def start_cleanup_task():
     asyncio.create_task(_cleanup_loop())
+    asyncio.create_task(_observer_report_loop())
 
 
 @app.on_event("shutdown")
@@ -918,8 +1058,28 @@ async def _cleanup_loop():
                     pass
                 log_debug(f"[LIVESTREAMER] [CLEANUP] Removed game {lobby_id}")
                 reason = notify_reasons.get(lobby_id)
+                # A session already marked `ended` was closed by remove_source, which already
+                # flagged it for an is_live=False report. A session reaped purely for
+                # inactivity/undescribed was never closed by a source disconnect, so the relay
+                # must flag it here.
                 if reason:
-                    await notify_stream_ended(lobby_id, reason)
+                    mark_stream_ended(lobby_id)
+
+
+async def _observer_report_loop():
+    """Periodically flush the observer-count batch to GO.
+
+    A baseline on top of the change-triggered flush: even a stream whose observer set has been
+    static for a while gets a fresh state every OBSERVER_UPDATE_INTERVAL, so GO's observer_count
+    never goes stale (e.g. if a change-triggered flush was lost). It drains the same dirty sets,
+    so lobbies whose count is unchanged from the last posted value are skipped — cheap.
+    """
+    while True:
+        await asyncio.sleep(OBSERVER_UPDATE_INTERVAL)
+        try:
+            await flush_observer_batch()
+        except Exception as e:
+            log_warn(f"[LIVESTREAM] [WARN] periodic observer batch flush failed: {type(e).__name__}: {e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -933,7 +1093,7 @@ if __name__ == "__main__":
     print(f"[START] Max observers: {MAX_OBSERVERS_PER_GAME}, Chunk size: {CHUNK_SIZE} bytes")
     if not INTERNAL_API_KEY:
         print("[START] WARNING: INTERNAL_API_KEY is not set — /internal/* endpoints will refuse all calls")
-    if GO_STREAM_ENDED_URL and not GO_API_KEY:
-        print("[START] WARNING: GO_STREAM_ENDED_URL is set but GO_API_KEY is not — "
-              "GO will reject the stream-ended notification (401)")
+    if GO_OBSERVERS_URL and not GO_API_KEY:
+        print("[START] WARNING: GO_OBSERVERS_URL is set but GO_API_KEY is not — "
+              "GO will reject the observer-count notification (401)")
     uvicorn.run(app, host=host, port=PORT)
