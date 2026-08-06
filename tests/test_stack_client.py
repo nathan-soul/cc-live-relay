@@ -318,14 +318,29 @@ async def main():
     assert stream_url, f"register returned no url: {reg}"
     ok(f"livestream registered, stream url={stream_url}")
 
-    # 5b. List livestreams shows our lobby
+    # 5b. Registering must NOT list the lobby yet. A relay session exists, but nothing has
+    # been streamed into it -- an observer admitted now would watch nothing. GO only lists a
+    # lobby once the relay reports is_live, which happens on the host's first HEADER.
     livestreams = await list_livestreams(args.go, token_a)
-    found = [ls for ls in livestreams if str(ls.get("lobby_id")) == str(lobby_id)]
-    ok(f"livestreams list contains lobby {lobby_id}" if found else
-       f"livestreams list does NOT contain {lobby_id}: {livestreams}")
+    premature = [ls for ls in livestreams if str(ls.get("lobby_id")) == str(lobby_id)]
+    assert not premature, f"lobby {lobby_id} listed before any HEADER was streamed: {livestreams}"
+    ok("registered lobby is not listed before the stream has data")
 
-    # 6. Streamer connects to relay
+    # 6. Streamer connects to relay and sends HEADER + BODY
     streamer_ws = await stream_replay(rewrite_relay_host(stream_url, relay_host))
+
+    # 6b. The HEADER makes it live, and that report is sent immediately rather than through
+    # the relay's coalescing window -- so a short wait is enough. If this needs longer than a
+    # couple of seconds, liveness has regressed back into the batch (OBSERVER_CHANGE_TIMEOUT).
+    listed = []
+    for _ in range(20):
+        await asyncio.sleep(0.25)
+        livestreams = await list_livestreams(args.go, token_a)
+        listed = [ls for ls in livestreams if str(ls.get("lobby_id")) == str(lobby_id)]
+        if listed:
+            break
+    assert listed, f"lobby {lobby_id} never appeared in /Livestreams after HEADER: {livestreams}"
+    ok(f"lobby {lobby_id} listed once the stream had data")
 
     # 7. Second user (observer) logs in + observes
     login_b = await check_login(args.go)
