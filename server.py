@@ -5,7 +5,7 @@ Architecture: GO Services → Relay → Observer/Streamer
 GO services validates user JWTs and calls this relay over HTTP with a shared
 INTERNAL_API_KEY to mint single-use stream tokens (streamers) and watch tickets
 (observers). This relay never sees a user JWT; it only trusts GO. See
-plans/archive/relay-go-orchestrated-livestreams.md for the original design (parts of it
+plans/relay/archive/relay-go-orchestrated-livestreams.md for the original design (parts of it
 are superseded; docs/running-the-stack.md is current).
 
 WebSocket-based relay with binary envelope protocol (msg types 0-6).
@@ -58,6 +58,20 @@ MAX_DELAY_SECONDS = 600
 # second, which can OOM the container. A bounded cap keeps the fan-out concurrent but limits the
 # task churn. Lower = gentler on memory, higher = lower per-observer tail latency.
 BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "256"))
+
+# ── Per-source health / demotion (all-push model, plans/relay/streamer-allpush-demotion.md) ──
+# Every can_stream player pushes; the relay watches each source for problems and tells a bad
+# source to become a backup (role=backup) when it crosses any threshold below, as long as at
+# least one other active pusher remains (the last pusher is never demoted, so the stream can
+# never die from demotion alone). A demoted source stays connected and keeps recording; if the
+# last active pusher later leaves, the relay re-promotes the least-bad backup via a takeover
+# ROLE with the current body offset (see _promote_if_no_active).
+# SOURCE_LAG_BYTES: average lag per BODY frame (bytes behind the live edge at delivery).
+# SOURCE_GAP_STRIKES: BODY frames whose offset jumped past body_len.
+# SOURCE_SILENCE_SECONDS: how long a source may stay silent while the body advances.
+SOURCE_LAG_BYTES = int(os.getenv("SOURCE_LAG_BYTES", str(64 * 1024)))
+SOURCE_GAP_STRIKES = int(os.getenv("SOURCE_GAP_STRIKES", "3"))
+SOURCE_SILENCE_SECONDS = int(os.getenv("SOURCE_SILENCE_SECONDS", "10"))
 
 # Verbose per-game / per-connection logging. Enable with DEBUG=1 (or "true"/"yes"/"on").
 DEBUG = os.getenv("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
@@ -294,6 +308,12 @@ class GameSession:
         # info is GO's business; the relay stores it only so admission checks could bind to it.
         self.owner_user_id: Optional[int] = None
 
+        # Per-source health for the all-push demotion model (plans/relay/streamer-allpush-demotion.md).
+        # Keyed by the source's WebSocket; populated at registration, updated as frames arrive.
+        # A source whose health crosses a threshold is told role=backup and its frames are
+        # ignored; it may be re-promoted later if the last active pusher leaves.
+        self._source_health: dict[WebSocket, dict] = {}
+
         self._lock = asyncio.Lock()
         self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
         self._observer_catchup_limit: dict[WebSocket, int] = {}
@@ -302,8 +322,56 @@ class GameSession:
 
     # ── Data ingestion (called from source loop) ─────────────────────────
 
+    def _source_demoted(self, ws: WebSocket) -> bool:
+        """Whether this source has been told to stop pushing (role=backup)."""
+        health = self._source_health.get(ws)
+        return health is not None and health.get("demoted", False)
+
+    def _touch_source(self, ws: WebSocket) -> None:
+        """Record that this source sent a frame, for the silence check.
+
+        Called from the source loop on every accepted frame. Not called for demoted
+        sources — they are not expected to send anything once demoted.
+        """
+        health = self._source_health.get(ws)
+        if health is not None and not health.get("demoted", False):
+            health["last_frame_at"] = time.time()
+            health["body_len_seen"] = len(self.body)
+
+    def _record_frame_health(self, ws: WebSocket, lag_bytes: int = 0,
+                             gap: bool = False, mismatch: bool = False) -> None:
+        """Accumulate this source's health counters for one BODY frame.
+
+        lag_bytes is how far behind the live edge this source's chunk arrived
+        (body_len - offset, 0 for the source that just appended). Demoted sources
+        are not tracked — their frames are ignored anyway.
+        """
+        health = self._source_health.get(ws)
+        if health is None or health.get("demoted", False):
+            return
+        health["lag_bytes"] += max(0, lag_bytes)
+        health["frames_seen"] += 1
+        if gap:
+            health["gap_strikes"] += 1
+        if mismatch:
+            health["mismatch_strikes"] += 1
+
+    def _source_health_score(self, health: dict) -> float:
+        """A single number ordering sources worst-first: higher = worse connection.
+
+        Average lag per frame is the primary signal (it directly measures how far behind
+        the live edge this source's identical bytes arrive); gap strikes weight heavily
+        since a gappy source is actively dropping data. Used to pick the least-bad
+        demoted source for re-promotion.
+        """
+        frames = max(1, health.get("frames_seen", 0))
+        avg_lag = health.get("lag_bytes", 0) / frames
+        return avg_lag + 8 * SOURCE_LAG_BYTES * health.get("gap_strikes", 0)
+
     async def apply_header(self, ws: WebSocket, payload: bytes) -> None:
         """Store canonical header (first received wins). Broadcast once."""
+        if self._source_demoted(ws):
+            return
         should_broadcast = False
         async with self._lock:
             if not self.header_received:
@@ -326,6 +394,8 @@ class GameSession:
 
     async def apply_patch(self, ws: WebSocket, payload: bytes) -> None:
         """Apply patch to header at given offset, broadcast to observers."""
+        if self._source_demoted(ws):
+            return
         if len(payload) < 8:
             log_warn(f"[LIVESTREAMER] [WARN] PATCH payload too short: {len(payload)} bytes")
             return
@@ -344,6 +414,8 @@ class GameSession:
 
     async def apply_body(self, ws: WebSocket, payload: bytes) -> None:
         """Append body data. Payload always has [8B offset uint64 LE][data]."""
+        if self._source_demoted(ws):
+            return
         if len(payload) < 8:
             log_warn(f"[LIVESTREAMER] [WARN] BODY payload too short: {len(payload)} bytes")
             return
@@ -360,6 +432,7 @@ class GameSession:
                 self.body.extend(data)
                 self.last_active = time.time()
                 should_broadcast = True
+                self._record_frame_health(ws, lag_bytes=0)
                 # Fix the recipient list here, while still holding the lock that guards the
                 # append. An observer registering after this point records a catch-up limit
                 # that already covers these bytes, so sending them the live chunk as well
@@ -373,9 +446,13 @@ class GameSession:
                 if data[:overlap] != existing:
                     log_warn(f"[LIVESTREAMER] [WARN] BODY desync for game {self.lobby_id}: "
                           f"offset={offset} overlap={overlap} mismatch!")
+                    self._record_frame_health(ws, lag_bytes=body_len - offset, mismatch=True)
+                else:
+                    self._record_frame_health(ws, lag_bytes=body_len - offset)
             else:
                 log_warn(f"[LIVESTREAMER] [ERROR] BODY gap for game {self.lobby_id}: "
                       f"offset={offset} > body_len={body_len} — dropping, investigate source")
+                self._record_frame_health(ws, lag_bytes=offset - body_len, gap=True)
 
         if should_broadcast:
             file_offset = len(self.header) + offset
@@ -402,6 +479,7 @@ class GameSession:
         ended_here = False
         async with self._lock:
             self.sources.discard(ws)
+            self._source_health.pop(ws, None)
             if not self.sources and self.end_received:
                 self.ended = True
                 should_broadcast_end = True
@@ -428,6 +506,100 @@ class GameSession:
         # stream, because the match ending and the stream ending are different events.
         if ended_here:
             mark_stream_ended(self.lobby_id)
+        elif not self.ended:
+            # A source left but the session lives on. If it was the last active (non-demoted)
+            # pusher, re-promote the least-bad demoted backup so the stream continues instead
+            # of stalling on a silent roster.
+            await self._maybe_promote_backup()
+
+    # ── All-push demotion / re-promotion (plans/relay/streamer-allpush-demotion.md) ──
+
+    def _active_source_count(self) -> int:
+        """Number of sources that are not demoted (i.e. still expected to push)."""
+        return sum(1 for ws, h in self._source_health.items()
+                   if ws in self.sources and not h.get("demoted", False))
+
+    def _should_demote(self, ws: WebSocket) -> Optional[str]:
+        """Return the reason this source should be demoted, or None.
+
+        Checks are cumulative over the source's lifetime (lag_bytes, gap_strikes) rather
+        than instantaneous, so a source must *persistently* misbehave before it is demoted —
+        one bad frame is jitter, ten are a pattern. A source that is silent while the body
+        advances is dead weight and gets demoted too, unless it is the last active pusher
+        (that check lives in _maybe_demote_source, which owns the "never demote last" rule).
+        """
+        health = self._source_health.get(ws)
+        if health is None or health.get("demoted", False):
+            return None
+        if health.get("gap_strikes", 0) >= SOURCE_GAP_STRIKES:
+            return f"gap_strikes={health['gap_strikes']} >= {SOURCE_GAP_STRIKES}"
+        if health.get("lag_bytes", 0) >= SOURCE_LAG_BYTES:
+            return f"lag_bytes={health['lag_bytes']} >= {SOURCE_LAG_BYTES}"
+        silent = time.time() - health.get("last_frame_at", 0)
+        # Silence only counts as a problem when the body has moved on without this source —
+        # a paused game advances nobody's counters, and the streamer of a quiet moment is
+        # not misbehaving.
+        if silent > SOURCE_SILENCE_SECONDS and len(self.body) > health.get("body_len_seen", 0):
+            return f"silent={int(silent)}s"
+        return None
+
+    async def _maybe_demote_source(self, ws: WebSocket) -> bool:
+        """Demote this source if its health warrants it, never the last active pusher.
+
+        Sends role=backup to the source and marks it demoted so its frames are ignored
+        from here on. The last active pusher is exempt: demoting it would leave the session
+        with nobody streaming (re-promotion cannot fix a roster of only demoted sources —
+        the takeover path needs an active pusher to have left *after* backups were made).
+        Returns True if the source was demoted.
+        """
+        if not ws in self.sources or self._source_demoted(ws):
+            return False
+        async with self._lock:
+            if self._active_source_count() <= 1:
+                return False
+            reason = self._should_demote(ws)
+            if reason is None:
+                return False
+            self._source_health[ws]["demoted"] = True
+
+        role_json = json.dumps({"role": "backup", "lobbyid": self.lobby_id,
+            "body_offset": len(self.body)}, separators=(',', ':'))
+        log_warn(f"[LIVESTREAMER] [DEMOTE] Game {self.lobby_id}: source demoted to backup ({reason})")
+        try:
+            await ws.send_bytes(pack_frame(MSG_ROLE, role_json.encode()))
+        except Exception as e:
+            log_warn(f"[LIVESTREAMER] [DEMOTE] failed to notify source: {type(e).__name__}: {e}")
+        return True
+
+    async def _maybe_promote_backup(self) -> bool:
+        """Re-promote the least-bad demoted source when no active pusher remains.
+
+        Called after a source leaves. If demoted backups are still connected, the stream
+        must not die: pick the least-bad one (by health score), send it a takeover ROLE
+        carrying the current body offset, and let it backfill from its local recording.
+        Returns True if a backup was promoted.
+        """
+        async with self._lock:
+            if self._active_source_count() > 0:
+                return False
+            candidates = [(ws, h) for ws, h in self._source_health.items()
+                          if ws in self.sources and h.get("demoted", False)]
+            if not candidates:
+                return False
+            ws, _ = min(candidates, key=lambda item: self._source_health_score(item[1]))
+            self._source_health[ws]["demoted"] = False
+            body_offset = len(self.body)
+
+        role_json = json.dumps({"role": "streamer", "action": "takeover",
+            "lobbyid": self.lobby_id, "body_offset": body_offset}, separators=(',', ':'))
+        log_warn(f"[LIVESTREAMER] [PROMOTE] Game {self.lobby_id}: backup promoted to streamer"
+              f" at body_offset={body_offset}")
+        try:
+            await ws.send_bytes(pack_frame(MSG_ROLE, role_json.encode()))
+        except Exception as e:
+            log_warn(f"[LIVESTREAMER] [PROMOTE] failed to notify backup: {type(e).__name__}: {e}")
+            return False
+        return True
 
     # ── Observer lifecycle ───────────────────────────────────────────────
 
@@ -547,7 +719,7 @@ class GameSession:
         # Concurrent, not sequential: a single slow/laggy observer must not delay delivery to
         # every other observer of this game. Previously this was a plain `for` loop awaiting
         # each send in turn, which measured as multi-second tail latency once a game had more
-        # than ~50-150 concurrent observers (see plans/relay-scaling-rework.md, "Load test
+        # than ~50-150 concurrent observers (see plans/relay/archive/relay-scaling-rework.md, "Load test
         # findings"). `dead.append` from concurrent tasks is safe without a lock: asyncio tasks
         # are cooperatively scheduled on one thread, so list.append can't interleave.
         #
@@ -581,7 +753,7 @@ games: dict[str, GameSession] = {}
 
 # Single-use credentials minted on GO's behalf via /internal/* (plans/
 # relay-go-orchestrated-livestreams.md). In-process for now — becomes Redis once the
-# dispatcher tier in plans/relay-scaling-rework.md exists and needs the same lookup shared
+# dispatcher tier in plans/relay/archive/relay-scaling-rework.md exists and needs the same lookup shared
 # across processes. Key -> {lobby_id, user_id, expires_at} (expires_at unix seconds).
 watch_tickets: dict[str, dict] = {}
 stream_tokens: dict[str, dict] = {}
@@ -1055,6 +1227,15 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
         role = "streamer"
         async with session._lock:
             session.sources.add(websocket)
+            session._source_health[websocket] = {
+                "demoted": False,
+                "lag_bytes": 0,
+                "gap_strikes": 0,
+                "mismatch_strikes": 0,
+                "frames_seen": 0,
+                "last_frame_at": time.time(),
+                "body_len_seen": len(session.body),
+            }
 
         # ── Send ROLE response (binary) ────────────────────────────────
         role_json = json.dumps({"role": role, "lobbyid": session.lobby_id,
@@ -1104,6 +1285,13 @@ async def _source_loop(ws: WebSocket, session: GameSession) -> None:
                 session.end_received = True
             log_debug(f"[LIVESTREAMER] [END] Source sent END for game {session.lobby_id}")
             break
+
+        session._touch_source(ws)
+        # Demotion is checked per-frame so a persistently bad source is stopped quickly.
+        # The per-source counters make this cheap: no timers, just arithmetic.
+        if await session._maybe_demote_source(ws):
+            log_debug(f"[LIVESTREAMER] [DEMOTE] Source {id(ws):x} no longer pushing for "
+                      f"game {session.lobby_id}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1214,6 +1402,17 @@ async def _cleanup_loop():
                 # must flag it here.
                 if reason:
                     mark_stream_ended(lobby_id)
+
+        # Silence sweep for the all-push demotion model: a source that is silent while the
+        # body advances is dead weight and should be demoted. This runs here because the
+        # per-frame check in _source_loop only fires when *some* source is still sending —
+        # if every source goes quiet, nobody triggers it. The "never demote the last active
+        # pusher" guard inside _maybe_demote_source keeps the stream alive regardless.
+        for session in games.values():
+            if session.ended:
+                continue
+            for ws in list(session.sources):
+                await session._maybe_demote_source(ws)
 
 
 async def _observer_report_loop():
