@@ -8,7 +8,7 @@ INTERNAL_API_KEY to mint single-use stream tokens (streamers) and watch tickets
 plans/relay/archive/relay-go-orchestrated-livestreams.md for the original design (parts of it
 are superseded; docs/running-the-stack.md is current).
 
-WebSocket-based relay with binary envelope protocol (msg types 0-6).
+WebSocket-based relay with binary envelope protocol (msg types 0-8).
 Aligned with the C++ LiveStreamer/LiveObserver client (libcurl websockets).
 """
 
@@ -19,6 +19,7 @@ import os
 import secrets
 import struct
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,8 +35,20 @@ MSG_BODY     = 3
 MSG_END      = 4
 MSG_ROLE     = 5
 MSG_ERROR    = 6
+MSG_CHAT     = 7
+MSG_SPECTATOR_CHAT = 8
 
 CHUNK_SIZE = 256 * 1024  # 256 KB per chunk for observer catch-up
+
+# ── Chat (plans/relay/live-observer-chat.md + live-observer-spectator-chat.md) ──
+# MSG_CHAT = player chat, frame-stamped by the streamer, frame-gated on the observer;
+# the relay stores a bounded history so late-joining watchers get the recent slice in
+# their catch-up. MSG_SPECTATOR_CHAT = live spectator meta-chat (Twitch-style): no
+# history by design ("you missed it"), rate-limited per connection.
+CHAT_HISTORY_MAX = 200          # bounded chat_history per session (player chat)
+CHAT_CATCHUP_COUNT = 10         # last-N chat frames sent to a joining observer
+SPECTATOR_RATE_MAX = 5          # spectator messages allowed per window...
+SPECTATOR_RATE_WINDOW = 10      # ...per this many seconds, per connection
 
 # ── Configuration via environment variables ────────────────────────────────
 PORT = int(os.getenv("PORT", "8765"))
@@ -314,6 +327,18 @@ class GameSession:
         # ignored; it may be re-promoted later if the last active pusher leaves.
         self._source_health: dict[WebSocket, dict] = {}
 
+        # Per-source REGISTER flag: whether this source is an in-game observer (Side 1,
+        # not an active player). Spectator chat reaches observer-mode sources only;
+        # streaming players never see it (plans/relay/live-observer-spectator-chat.md).
+        self._source_observer: dict[WebSocket, bool] = {}
+
+        # Player chat history (MSG_CHAT, frame-stamped): bounded, opaque payloads.
+        # The last CHAT_CATCHUP_COUNT entries are sent to a joining observer.
+        self.chat_history: deque = deque(maxlen=CHAT_HISTORY_MAX)
+
+        # Spectator chat rate limiting (MSG_SPECTATOR_CHAT): per-connection timestamps.
+        self._spectator_rate: dict[WebSocket, list] = {}
+
         self._lock = asyncio.Lock()
         self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
         self._observer_catchup_limit: dict[WebSocket, int] = {}
@@ -459,6 +484,77 @@ class GameSession:
             framed = struct.pack('<Q', file_offset) + data
             await self._broadcast_envelope(MSG_BODY, framed, targets=targets)
 
+    # ── Chat (plans/relay/live-observer-chat.md + live-observer-spectator-chat.md) ──
+
+    async def apply_chat(self, ws: WebSocket, payload: bytes) -> None:
+        """Player chat (MSG_CHAT): store + broadcast. Deduped by opaque payload.
+
+        All-push model: every source's client executes the same NetChatCommandMsg at the
+        same frame, so several sources forward byte-identical copies of each message —
+        whole-payload dedupe against the history drops the duplicates. The frame lives
+        inside the payload, so no parsing is needed for the check.
+        """
+        if self._source_demoted(ws):
+            return
+        if not payload:
+            return
+        async with self._lock:
+            if payload in self.chat_history:
+                return
+            self.chat_history.append(payload)
+            self.last_active = time.time()
+        log_debug(f"[LIVESTREAMER] [CHAT] Game {self.lobby_id}: player chat frame ({len(payload)}B)")
+        await self._broadcast_envelope(MSG_CHAT, payload)
+
+    def _source_is_observer(self, ws: WebSocket) -> bool:
+        """Whether this source registered as an in-game observer (REGISTER is_observer)."""
+        return self._source_observer.get(ws, False)
+
+    async def _send_to_observer_sources(self, payload: bytes) -> None:
+        """Fan a spectator chat frame out to observer-mode sources only.
+
+        Streaming players must never see spectator chat, so the receiver set is the
+        session's sources filtered by their REGISTER is_observer flag — not all sources.
+        Plain send_bytes with per-socket error handling; sources have no catch-up/lock
+        machinery (spectator chat is live and unordered).
+        """
+        frame = pack_frame(MSG_SPECTATOR_CHAT, payload)
+        dead: list[WebSocket] = []
+        for ws in list(self.sources):
+            if not self._source_is_observer(ws):
+                continue
+            try:
+                await ws.send_bytes(frame)
+            except Exception as e:
+                log_warn(f"[LIVESTREAMER] [WARN] spectator chat send to source failed "
+                         f"({type(e).__name__}: {e}), marking dead")
+                dead.append(ws)
+        for ws in dead:
+            self.sources.discard(ws)
+            self._source_health.pop(ws, None)
+            self._source_observer.pop(ws, None)
+
+    async def apply_spectator_chat(self, ws: WebSocket, payload: bytes) -> None:
+        """Spectator chat (MSG_SPECTATOR_CHAT): live, rate-limited, no history.
+
+        Senders: watchers (v1) and, defensively, observer-mode sources. Broadcast to all
+        watchers plus observer-mode sources. Deliberately no history/catch-up — a late
+        joiner missed it ("you missed it" is the requirement).
+        """
+        if not payload:
+            return
+        now = time.time()
+        stamps = self._spectator_rate.get(ws, [])
+        stamps = [t for t in stamps if now - t < SPECTATOR_RATE_WINDOW]
+        if len(stamps) >= SPECTATOR_RATE_MAX:
+            log_warn(f"[LIVESTREAMER] [CHAT] spectator chat rate-limited for {id(ws):x}")
+            return
+        stamps.append(now)
+        self._spectator_rate[ws] = stamps
+        log_debug(f"[LIVESTREAMER] [CHAT] Game {self.lobby_id}: spectator chat ({len(payload)}B)")
+        await self._broadcast_envelope(MSG_SPECTATOR_CHAT, payload)
+        await self._send_to_observer_sources(payload)
+
     def save_replay(self) -> None:
         """Write header + body to a .rep file when the game ends."""
         if not self.header:
@@ -480,6 +576,8 @@ class GameSession:
         async with self._lock:
             self.sources.discard(ws)
             self._source_health.pop(ws, None)
+            self._source_observer.pop(ws, None)
+            self._spectator_rate.pop(ws, None)
             if not self.sources and self.end_received:
                 self.ended = True
                 should_broadcast_end = True
@@ -637,6 +735,7 @@ class GameSession:
             self.observer_ws_set.discard(ws)
             self._observer_send_locks.pop(ws, None)
             self._observer_catchup_limit.pop(ws, None)
+            self._spectator_rate.pop(ws, None)
         mark_observer_change(self.lobby_id)
 
     async def send_catchup(self, ws: WebSocket, last_offset: int = 0,
@@ -689,6 +788,13 @@ class GameSession:
 
         if ended_snapshot:
             await ws.send_bytes(pack_frame(MSG_END, b''))
+
+        # Player-chat history slice for the joining observer: the last few chat frames,
+        # sent after the body. Order is irrelevant — the observer frame-gates them. No
+        # spectator-chat history by design.
+        chat_slice = list(self.chat_history)[-CHAT_CATCHUP_COUNT:]
+        for chat_payload in chat_slice:
+            await ws.send_bytes(pack_frame(MSG_CHAT, chat_payload))
 
         log_debug(f"[OBSERVER] [CATCHUP] Sent header ({len(header_snapshot)}B) + body ({len(body_snapshot)}B, offset={last_offset}) to observer")
 
@@ -1183,6 +1289,9 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
 
         player_name = reg.get("player_name", "unknown")
         can_stream = reg.get("can_stream", False)
+        # In-game observer (Side 1, not an active player)? Gates which sources receive
+        # spectator chat (plans/relay/live-observer-spectator-chat.md).
+        is_observer = bool(reg.get("is_observer", False))
 
         if not can_stream:
             await reject(websocket, "stream token valid, but can_stream required")
@@ -1227,6 +1336,7 @@ async def stream_endpoint(websocket: WebSocket, lobby_id: str):
         role = "streamer"
         async with session._lock:
             session.sources.add(websocket)
+            session._source_observer[websocket] = is_observer
             session._source_health[websocket] = {
                 "demoted": False,
                 "lag_bytes": 0,
@@ -1280,6 +1390,14 @@ async def _source_loop(ws: WebSocket, session: GameSession) -> None:
             await session.apply_patch(ws, payload)
         elif msg_type == MSG_BODY:
             await session.apply_body(ws, payload)
+        elif msg_type == MSG_CHAT:
+            await session.apply_chat(ws, payload)
+        elif msg_type == MSG_SPECTATOR_CHAT:
+            # Defence in depth: a streaming player may not send spectator chat; an
+            # observer-mode source may (the client does not send it in v1, but the relay
+            # should not reject a legitimate observer-source).
+            if session._source_is_observer(ws):
+                await session.apply_spectator_chat(ws, payload)
         elif msg_type == MSG_END:
             async with session._lock:
                 session.end_received = True
@@ -1341,6 +1459,16 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
             msg = await websocket.receive()
             if msg.get("type") == "websocket.disconnect":
                 break
+
+            # Watchers are senders of spectator chat (MSG_SPECTATOR_CHAT). Anything else
+            # from an observer is ignored — observers push nothing else.
+            if "bytes" in msg:
+                try:
+                    msg_type, payload = unpack_frame(msg["bytes"])
+                    if msg_type == MSG_SPECTATOR_CHAT:
+                        await session.apply_spectator_chat(websocket, payload)
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         log_debug(f"[OBSERVER] [WATCH] Observer disconnected from game {lobby_id}")

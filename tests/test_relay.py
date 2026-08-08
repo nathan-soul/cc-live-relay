@@ -34,6 +34,8 @@ MSG_BODY     = 3
 MSG_END      = 4
 MSG_ROLE     = 5
 MSG_ERROR    = 6
+MSG_CHAT     = 7
+MSG_SPECTATOR_CHAT = 8
 
 
 def pack_frame(msg_type: int, payload: bytes = b"") -> bytes:
@@ -88,7 +90,7 @@ async def mint_watch_ticket(lobby_id, user_id=9):
     return data["url"].split("ticket=")[1]
 
 
-async def connect_source(lobby_id, user_id=1):
+async def connect_source(lobby_id, user_id=1, is_observer=False):
     """Connect a source to /stream with a freshly minted token, do the REGISTER handshake."""
     token = await mint_stream_token(lobby_id, user_id)
     ws = await websockets.connect(f"{BASE}/stream/{lobby_id}?stream_token={token}")
@@ -97,6 +99,7 @@ async def connect_source(lobby_id, user_id=1):
         "player_name": f"Source{user_id}",
         "can_stream": True,
         "is_host": True,
+        "is_observer": is_observer,
     }).encode()))
     raw = await asyncio.wait_for(ws.recv(), timeout=3.0)
     assert unpack_frame(raw)[0] == MSG_ROLE, f"expected ROLE, got {raw!r}"
@@ -340,6 +343,198 @@ async def test_dual_source_dedup():
     await asyncio.sleep(0.2)
 
 
+# ── Chat (MSG_CHAT / MSG_SPECTATOR_CHAT) ───────────────────────────────────
+
+async def test_player_chat_roundtrip_dedup_history():
+    print("\n=== Player chat (MSG_CHAT): live broadcast, dedup, late-join history slice ===")
+    await register_livestream("test_chat_001")
+    sws_a = await connect_source("test_chat_001", user_id=1)
+    sws_b = await connect_source("test_chat_001", user_id=2)
+    await sws_a.send(pack_frame(MSG_HEADER, b"CHAT_HEADER_001"))
+    await asyncio.sleep(0.2)
+
+    # All-push: two sources forward byte-identical copies of the same chat frame.
+    chat1 = struct.pack('<II', 100, 5) + b"hello" + struct.pack('<I', 0x00FF00)
+    await sws_a.send(pack_frame(MSG_CHAT, chat1))
+    await sws_b.send(pack_frame(MSG_CHAT, chat1))
+    await asyncio.sleep(0.3)
+
+    # A watcher joining after the chat was sent must get it via the catch-up slice, once.
+    ticket = await mint_watch_ticket("test_chat_001", user_id=9)
+    async with websockets.connect(f"{BASE}/watch/test_chat_001?ticket={ticket}") as ows:
+        chats = []
+        try:
+            for _ in range(15):
+                raw = await asyncio.wait_for(ows.recv(), timeout=1.0)
+                if isinstance(raw, bytes):
+                    t, pl = unpack_frame(raw)
+                    if t == MSG_CHAT:
+                        chats.append(pl)
+        except asyncio.TimeoutError:
+            pass
+        assert chats.count(chat1) == 1, f"expected exactly one copy of chat1, got {chats.count(chat1)}"
+        ok("late-join observer received the chat history slice exactly once (deduped)")
+
+    # A second late joiner sees both chats in the history.
+    chat2 = struct.pack('<II', 200, 5) + b"world" + struct.pack('<I', 0x0000FF)
+    await sws_a.send(pack_frame(MSG_CHAT, chat2))
+    await asyncio.sleep(0.2)
+    ticket2 = await mint_watch_ticket("test_chat_001", user_id=10)
+    async with websockets.connect(f"{BASE}/watch/test_chat_001?ticket={ticket2}") as ows2:
+        chats2 = []
+        try:
+            for _ in range(15):
+                raw = await asyncio.wait_for(ows2.recv(), timeout=1.0)
+                if isinstance(raw, bytes):
+                    t, pl = unpack_frame(raw)
+                    if t == MSG_CHAT:
+                        chats2.append(pl)
+        except asyncio.TimeoutError:
+            pass
+        assert chat1 in chats2 and chat2 in chats2, f"history should contain both chats, got {len(chats2)}"
+        ok("catch-up history slice contains both prior chats")
+
+    await sws_a.send(pack_frame(MSG_END, b""))
+    await sws_b.send(pack_frame(MSG_END, b""))
+    await asyncio.sleep(0.2)
+    await sws_a.close()
+    await sws_b.close()
+
+
+async def test_spectator_chat_audience():
+    print("\n=== Spectator chat (MSG_SPECTATOR_CHAT): watchers + observer-mode sources only ===")
+    await register_livestream("test_chat_002")
+    player_src = await connect_source("test_chat_002", user_id=1)
+    obs_src = await connect_source("test_chat_002", user_id=2, is_observer=True)
+    await player_src.send(pack_frame(MSG_HEADER, b"CHAT_HEADER_002"))
+    await asyncio.sleep(0.2)
+
+    ticket1 = await mint_watch_ticket("test_chat_002", user_id=9)
+    ticket2 = await mint_watch_ticket("test_chat_002", user_id=10)
+    w1 = await websockets.connect(f"{BASE}/watch/test_chat_002?ticket={ticket1}")
+    w2 = await websockets.connect(f"{BASE}/watch/test_chat_002?ticket={ticket2}")
+    for ws in (w1, w2):
+        try:
+            for _ in range(10):
+                await asyncio.wait_for(ws.recv(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+
+    spec = struct.pack('<I', 4) + b"Spec" + struct.pack('<I', 5) + b"hello"
+    await w1.send(pack_frame(MSG_SPECTATOR_CHAT, spec))
+    await asyncio.sleep(0.3)
+
+    got_w2 = None
+    try:
+        for _ in range(5):
+            raw = await asyncio.wait_for(w2.recv(), timeout=1.0)
+            if isinstance(raw, bytes):
+                t, pl = unpack_frame(raw)
+                if t == MSG_SPECTATOR_CHAT:
+                    got_w2 = pl
+                    break
+    except asyncio.TimeoutError:
+        pass
+    assert got_w2 == spec, "watcher should receive spectator chat from another watcher"
+    ok("watcher received spectator chat from another watcher")
+
+    got_obs = None
+    try:
+        for _ in range(5):
+            raw = await asyncio.wait_for(obs_src.recv(), timeout=1.0)
+            t, pl = unpack_frame(raw)
+            if t == MSG_SPECTATOR_CHAT:
+                got_obs = pl
+                break
+    except asyncio.TimeoutError:
+        pass
+    assert got_obs == spec, "observer-mode source should receive spectator chat"
+    ok("observer-mode source received spectator chat")
+
+    got_player = None
+    try:
+        for _ in range(5):
+            raw = await asyncio.wait_for(player_src.recv(), timeout=0.5)
+            t, pl = unpack_frame(raw)
+            if t == MSG_SPECTATOR_CHAT:
+                got_player = pl
+                break
+    except asyncio.TimeoutError:
+        pass
+    assert got_player is None, "streaming player must not receive spectator chat"
+    ok("streaming player did not receive spectator chat")
+
+    # Late joiner gets no spectator-chat history ("you missed it").
+    ticket3 = await mint_watch_ticket("test_chat_002", user_id=11)
+    async with websockets.connect(f"{BASE}/watch/test_chat_002?ticket={ticket3}") as w3:
+        got_hist = None
+        try:
+            for _ in range(15):
+                raw = await asyncio.wait_for(w3.recv(), timeout=1.0)
+                if isinstance(raw, bytes):
+                    t, pl = unpack_frame(raw)
+                    if t == MSG_SPECTATOR_CHAT:
+                        got_hist = pl
+                        break
+        except asyncio.TimeoutError:
+            pass
+        assert got_hist is None, "late joiner must not get spectator chat history"
+        ok("late-joining watcher got no spectator chat history")
+
+    # A player source trying to send spectator chat is ignored (defence in depth).
+    await player_src.send(pack_frame(MSG_SPECTATOR_CHAT, spec))
+    await asyncio.sleep(0.2)
+    got_spam = None
+    try:
+        for _ in range(5):
+            raw = await asyncio.wait_for(w2.recv(), timeout=0.5)
+            if isinstance(raw, bytes):
+                t, pl = unpack_frame(raw)
+                if t == MSG_SPECTATOR_CHAT:
+                    got_spam = pl
+                    break
+    except asyncio.TimeoutError:
+        pass
+    assert got_spam is None, "player-source spectator chat must be ignored"
+    ok("player-source spectator chat ignored (defence in depth)")
+
+    for ws in (player_src, obs_src, w1, w2):
+        await ws.close()
+
+
+async def test_spectator_chat_rate_limit():
+    print("\n=== Spectator chat rate limit ===")
+    await register_livestream("test_chat_003")
+    sws = await connect_source("test_chat_003", user_id=1)
+    await sws.send(pack_frame(MSG_HEADER, b"H"))
+    await asyncio.sleep(0.2)
+    ticket = await mint_watch_ticket("test_chat_003", user_id=9)
+    async with websockets.connect(f"{BASE}/watch/test_chat_003?ticket={ticket}") as w:
+        try:
+            for _ in range(10):
+                await asyncio.wait_for(w.recv(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+
+        received = 0
+        for i in range(8):
+            payload = struct.pack('<I', 1) + b"X" + struct.pack('<I', 1) + bytes([i])
+            await w.send(pack_frame(MSG_SPECTATOR_CHAT, payload))
+        await asyncio.sleep(0.4)
+        try:
+            for _ in range(30):
+                raw = await asyncio.wait_for(w.recv(), timeout=1.0)
+                if isinstance(raw, bytes):
+                    t, pl = unpack_frame(raw)
+                    if t == MSG_SPECTATOR_CHAT:
+                        received += 1
+        except asyncio.TimeoutError:
+            pass
+        assert received <= 5, f"expected <=5 delivered (window is 5/10s), got {received}"
+        ok(f"rate limit held ({received} of 8 sent delivered)")
+    await sws.close()
+
+
 async def test_retired_endpoints_gone():
     print("\n=== Retired endpoints are gone ===")
     import aiohttp
@@ -376,6 +571,9 @@ async def main():
         test_watch_ticket_single_use,
         test_ticket_wrong_lobby_rejected,
         test_dual_source_dedup,
+        test_player_chat_roundtrip_dedup_history,
+        test_spectator_chat_audience,
+        test_spectator_chat_rate_limit,
         test_retired_endpoints_gone,
     ]
 
