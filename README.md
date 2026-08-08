@@ -12,7 +12,7 @@ Observer  (web client)  → Relay (this server)
 GO Services validates user JWTs and calls this relay over HTTP with a shared
 `INTERNAL_API_KEY` to mint **single-use stream tokens** (for streamers) and **single-use
 watch tickets** (for observers). The relay never sees a user JWT — it only trusts GO. See
-`plans/relay-go-orchestrated-livestreams.md` for the full design.
+`plans/relay/archive/relay-go-orchestrated-livestreams.md` for the full design.
 
 ## Protocols
 
