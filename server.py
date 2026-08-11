@@ -66,6 +66,18 @@ UNDESCRIBED_GAME_TTL = int(os.getenv("UNDESCRIBED_GAME_TTL", "120"))
 DEFAULT_DELAY_SECONDS = int(os.getenv("DEFAULT_DELAY_SECONDS", "15"))
 MAX_DELAY_SECONDS = 600
 
+# Byte-level delay hold (plans/relay/relay-server-side-delay-hold.md): a normal viewer of a
+# delayed stream only ever receives body bytes older than the host's delay, so a modified
+# client cannot fast-forward past the delayed data edge — the bytes do not exist yet. The
+# hold is a single shared delayed edge per session (arrival history + watermark), not
+# per-observer buffering: every held observer just tracks how far it has received. A global
+# ticker delivers chunks whose delay elapsed (flush-on-append covers the common case).
+DELAY_FLUSH_INTERVAL = float(os.getenv("DELAY_FLUSH_INTERVAL", "1.0"))
+# Hard cap on arrival-history entries (one per appended BODY frame), in case a pathological
+# source appends far faster than real-time recording would. The 2x-delay time trim below is
+# the real bound; this is a ceiling for extreme cases.
+BODY_HISTORY_MAX = 50_000
+
 # Max concurrent per-chunk observer sends in _broadcast_envelope. At scale (many games x many
 # observers) an unbounded per-observer task per BODY chunk creates tens of thousands of tasks a
 # second, which can OOM the container. A bounded cap keeps the fan-out concurrent but limits the
@@ -174,6 +186,7 @@ async def lifespan(app: FastAPI):
     background = [
         asyncio.create_task(_cleanup_loop()),
         asyncio.create_task(_observer_report_loop()),
+        asyncio.create_task(_delay_flush_loop()),
     ]
     try:
         yield
@@ -194,7 +207,7 @@ async def lifespan(app: FastAPI):
             _go_notify_session = None
 
 
-app = FastAPI(title="cc-live-relay", version="0.5.0", lifespan=lifespan)
+app = FastAPI(title="cc-live-relay", version="0.6.0", lifespan=lifespan)
 
 
 # ── Binary envelope helpers ────────────────────────────────────────────────
@@ -341,7 +354,21 @@ class GameSession:
 
         self._lock = asyncio.Lock()
         self._observer_send_locks: dict[WebSocket, asyncio.Lock] = {}
+        # Where an observer's delivered body ends. For a priority observer (or a delay-0
+        # session) it is the live edge at registration — live broadcasts carry on from it.
+        # For a held observer it is the delayed edge at registration and doubles as its
+        # delivery pointer: the shared flush advances it to the current watermark, so each
+        # byte is delivered exactly once, and the catch-up cap keeps live chunks from ever
+        # duplicating catch-up bytes (plans/relay/relay-server-side-delay-hold.md).
         self._observer_catchup_limit: dict[WebSocket, int] = {}
+        # Whether this observer is held behind the broadcast delay: non-priority watchers
+        # of a delayed session (priority = GO-stamped admin / user_priority=Viewer on the
+        # watch ticket). Held observers never receive BODY chunks directly — the shared
+        # delayed edge (see _flush_held_observers) delivers them at arrival + delay.
+        self._observer_held: dict[WebSocket, bool] = {}
+        # (arrival_ts, body_len) per appended BODY frame, trimmed to a 2x-delay window.
+        # One append per frame — no replay parsing. Feeds delayed_watermark().
+        self._body_history: deque = deque()
         # Last count actually posted to GO, so unchanged sessions skip redundant posts.
         self._last_reported_observers: Optional[int] = None
 
@@ -437,6 +464,45 @@ class GameSession:
             log_debug(f"[LIVESTREAMER] [PATCH] Game {self.lobby_id}: offset={offset} len={patch_len} header_size={len(self.header)}")
         await self._broadcast_envelope(MSG_PATCH, payload)
 
+    def delayed_watermark(self, now: float) -> int:
+        """Body length as of `now - delay`: the newest byte a held observer may receive.
+
+        Binary search over the per-append arrival history. A session younger than the
+        delay (or with no recorded history) yields 0 — held observers start from an empty
+        file and fill at the delayed edge. Delay 0 means no hold: the watermark is the
+        live edge.
+        """
+        if self.delay_seconds <= 0:
+            return len(self.body)
+        cutoff = now - self.delay_seconds
+        hist = self._body_history
+        if not hist or hist[0][0] > cutoff:
+            return 0
+        if hist[-1][0] <= cutoff:
+            return hist[-1][1]
+        lo, hi = 0, len(hist) - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if hist[mid][0] <= cutoff:
+                lo = mid
+            else:
+                hi = mid - 1
+        return hist[lo][1]
+
+    def _record_body_history(self, ts: float, body_len: int) -> None:
+        """Record one (arrival time, body length) pair for the watermark lookup.
+
+        One entry per appended BODY frame. Timestamps are non-decreasing (appends are
+        sequential), so the deque doubles as a sorted timeline. Trimmed to a 2x-max-delay
+        window plus a hard entry cap, so it stays small even for a long match.
+        """
+        self._body_history.append((ts, body_len))
+        cutoff = ts - 2 * MAX_DELAY_SECONDS
+        while len(self._body_history) > 1 and self._body_history[0][0] < cutoff:
+            self._body_history.popleft()
+        while len(self._body_history) > BODY_HISTORY_MAX:
+            self._body_history.popleft()
+
     async def apply_body(self, ws: WebSocket, payload: bytes) -> None:
         """Append body data. Payload always has [8B offset uint64 LE][data]."""
         if self._source_demoted(ws):
@@ -455,6 +521,7 @@ class GameSession:
 
             if offset == body_len:
                 self.body.extend(data)
+                self._record_body_history(time.time(), len(self.body))
                 self.last_active = time.time()
                 should_broadcast = True
                 self._record_frame_health(ws, lag_bytes=0)
@@ -483,6 +550,11 @@ class GameSession:
             file_offset = len(self.header) + offset
             framed = struct.pack('<Q', file_offset) + data
             await self._broadcast_envelope(MSG_BODY, framed, targets=targets)
+            # Delay hold: held observers' bytes become available at arrival + delay, so
+            # every append is also a chance to advance the shared delayed edge. This is
+            # the common delivery path; the global ticker catches quiet moments where no
+            # append happens for a while.
+            await self._flush_held_observers()
 
     # ── Chat (plans/relay/live-observer-chat.md + live-observer-spectator-chat.md) ──
 
@@ -701,7 +773,7 @@ class GameSession:
 
     # ── Observer lifecycle ───────────────────────────────────────────────
 
-    async def add_observer(self, ws: WebSocket) -> Optional[asyncio.Lock]:
+    async def add_observer(self, ws: WebSocket, priority: bool = False) -> Optional[asyncio.Lock]:
         """Register an observer, returning its send lock *already held*.
 
         The lock is taken before the socket joins observer_ws_set — that is, before it
@@ -710,6 +782,13 @@ class GameSession:
         each chunk at its absolute file offset, that leaves a hole in the observer's file.
         The old client tolerated it by accident (its playhead ran far behind the tail);
         the parse cursor added for the broadcast delay would stall on it instead.
+
+        priority marks a privileged watcher (admin / user_priority = Viewer, stamped on
+        the watch ticket by GO): it bypasses the delay hold and watches the live edge —
+        catch-up to the full body, live chunks as they arrive. Everyone else on a delayed
+        stream is held: catch-up serves only bytes older than the delay (the watermark at
+        registration), and the shared delayed edge delivers the rest at arrival + delay
+        (plans/relay/relay-server-side-delay-hold.md).
 
         The caller MUST release the lock once catch-up has been sent, including on error —
         _broadcast_envelope waits on these locks sequentially, so one held forever would
@@ -721,20 +800,36 @@ class GameSession:
             send_lock = asyncio.Lock()
             await send_lock.acquire()   # uncontended: nothing else can see it yet
             self._observer_send_locks[ws] = send_lock
-            # Body length at the instant this observer became a broadcast target. Catch-up
-            # sends up to exactly here and live broadcasts carry on from it, so every byte
-            # is delivered exactly once — no hole, and no overlapping resend either.
-            self._observer_catchup_limit[ws] = len(self.body)
+            # Held observers start at the delayed edge: their catch-up covers only bytes
+            # older than the delay, and the pointer doubles as "delivered so far", so the
+            # edge-flush can never duplicate or skip a byte.
+            held = not priority and self.delay_seconds > 0
+            self._observer_held[ws] = held
+            if held:
+                self._observer_catchup_limit[ws] = min(len(self.body),
+                                                       self.delayed_watermark(time.time()))
+                log_debug(f"[OBSERVER] [HOLD] Game {self.lobby_id}: observer held "
+                          f"{self.delay_seconds}s behind the live edge")
+            else:
+                # Body length at the instant this observer became a broadcast target.
+                # Catch-up sends up to exactly here and live broadcasts carry on from it,
+                # so every byte is delivered exactly once — no hole, no overlapping resend.
+                self._observer_catchup_limit[ws] = len(self.body)
             self.observer_ws_set.add(ws)
             self.last_active = time.time()
             mark_observer_change(self.lobby_id)
             return send_lock
 
     async def remove_observer(self, ws: WebSocket) -> None:
+        await self._drop_observer(ws)
+
+    async def _drop_observer(self, ws: WebSocket) -> None:
+        """Remove an observer and all of its per-observer state (also the dead-socket sweep)."""
         async with self._lock:
             self.observer_ws_set.discard(ws)
             self._observer_send_locks.pop(ws, None)
             self._observer_catchup_limit.pop(ws, None)
+            self._observer_held.pop(ws, None)
             self._spectator_rate.pop(ws, None)
         mark_observer_change(self.lobby_id)
 
@@ -761,10 +856,14 @@ class GameSession:
         async with self._lock:
             header_snapshot = bytes(self.header)
             ended_snapshot = self.ended
-            delay_snapshot = self.delay_seconds
-            # Stop exactly where live broadcasts to this observer begin. Snapshotting the
-            # whole body instead would resend anything appended between registration and
-            # now — data the observer is also about to receive as a live chunk.
+            held = self._observer_held.get(ws, False)
+            # Held observers get delay_seconds: 0 — the relay's byte-level hold IS the
+            # delay, and the client must not double-hold on top of it. Old clients that
+            # do not know about the hold play at the held edge correctly either way.
+            delay_snapshot = 0 if held else self.delay_seconds
+            # Stop exactly where the delivered edge begins. Snapshotting the whole body
+            # instead would resend anything appended between registration and now. For a
+            # held observer this is the watermark at registration — the delayed edge.
             limit = self._observer_catchup_limit.get(ws, len(self.body))
             body_snapshot = bytes(self.body[:limit])
 
@@ -787,6 +886,10 @@ class GameSession:
             await ws.send_bytes(pack_frame(MSG_BODY, chunk_payload))
 
         if ended_snapshot:
+            if held:
+                # Stream ended while this observer was joining: nothing is left to spoil,
+                # so drain the rest of its body now, then the END frame.
+                await self._flush_held_observer_locked(ws, force=True)
             await ws.send_bytes(pack_frame(MSG_END, b''))
 
         # Player-chat history slice for the joining observer: the last few chat frames,
@@ -797,6 +900,82 @@ class GameSession:
             await ws.send_bytes(pack_frame(MSG_CHAT, chat_payload))
 
         log_debug(f"[OBSERVER] [CATCHUP] Sent header ({len(header_snapshot)}B) + body ({len(body_snapshot)}B, offset={last_offset}) to observer")
+
+    # ── Delay hold (plans/relay/relay-server-side-delay-hold.md) ────────────
+    #
+    # A held observer never receives BODY bytes directly: the session owns a single
+    # delayed edge (the arrival history + watermark), and each held observer only tracks
+    # how far it has received (_observer_catchup_limit as a pointer). Delivering the same
+    # held copy to every watcher — rather than buffering per observer — is the
+    # in-process equivalent of the future dispatcher tier's worker B: a held /watch
+    # client of the live worker that re-serves delay_seconds: 0 to its own observers.
+    # This design maps onto that one with no new mechanism.
+
+    def _pack_body_frames(self, start: int, end: int) -> list:
+        """BODY frames covering body[start:end], chunked, with absolute file offsets."""
+        frames = []
+        header_size = len(self.header)
+        for chunk_off in range(start, end, CHUNK_SIZE):
+            chunk_end = min(chunk_off + CHUNK_SIZE, end)
+            chunk = bytes(self.body[chunk_off:chunk_end])
+            frames.append(pack_frame(MSG_BODY,
+                                     struct.pack('<Q', header_size + chunk_off) + chunk))
+        return frames
+
+    async def _flush_held_observer(self, ws: WebSocket, now: Optional[float] = None,
+                                   force: bool = False) -> None:
+        """Deliver a held observer's newly-due body bytes (acquires its send lock)."""
+        lock = self._observer_send_locks.get(ws)
+        if lock is None:
+            return
+        async with lock:
+            await self._flush_held_observer_locked(ws, now, force)
+
+    async def _flush_held_observer_locked(self, ws: WebSocket, now: Optional[float] = None,
+                                          force: bool = False) -> bool:
+        """Advance one held observer's delivered edge to the current watermark.
+
+        Caller must hold this observer's send lock — catch-up and the edge flush share
+        it, so a held chunk can never overtake the catch-up slice that precedes it.
+        force=True ignores the watermark and delivers everything left (stream end:
+        nothing is left to spoil). Returns False if the socket failed and the observer
+        was dropped.
+        """
+        if not self._observer_held.get(ws, False):
+            return True
+        if now is None:
+            now = time.time()
+        limit = len(self.body) if force else self.delayed_watermark(now)
+        pointer = self._observer_catchup_limit.get(ws, 0)
+        if limit <= pointer:
+            return True
+        try:
+            for frame in self._pack_body_frames(pointer, limit):
+                await ws.send_bytes(frame)
+        except Exception as e:
+            log_warn(f"[OBSERVER] [WARN] held send to observer failed "
+                     f"({type(e).__name__}: {e}), marking dead")
+            await self._drop_observer(ws)
+            return False
+        self._observer_catchup_limit[ws] = limit
+        return True
+
+    async def _flush_held_observers(self, now: Optional[float] = None) -> None:
+        """Advance every held observer to the shared delayed edge (flush-on-append).
+
+        All held observers of one session share the same watermark, so the edge is
+        computed once and each observer just advances its own pointer. Cheap when idle:
+        no held observers, no work. The global ticker calls this too, to catch chunks
+        whose delay elapsed while no append happened nearby (quiet moments).
+        """
+        if not self._observer_held:
+            return
+        if now is None:
+            now = time.time()
+        for ws in list(self.observer_ws_set):
+            if not self._observer_held.get(ws, False):
+                continue
+            await self._flush_held_observer(ws, now)
 
     # ── Broadcast ────────────────────────────────────────────────────────
 
@@ -811,10 +990,22 @@ class GameSession:
         frame = pack_frame(msg_type, payload)
         dead: list[WebSocket] = []
 
+        if msg_type == MSG_END:
+            # Stream over: nothing is left to spoil. Held observers get the rest of the
+            # body now (force flush), then the END frame below.
+            for ws in (targets if targets is not None else list(self.observer_ws_set)):
+                if self._observer_held.get(ws, False):
+                    await self._flush_held_observer(ws, force=True)
+
         async def send_one(ws: WebSocket) -> None:
             lock = self._observer_send_locks.get(ws)
             if lock is None:
                 return    # already removed, or never fully registered
+            # Held observers are served by the shared delayed edge, never a live chunk.
+            # Their pointer advances to the watermark at arrival + delay; sending the
+            # chunk directly here would put younger-than-delay bytes in their file.
+            if msg_type == MSG_BODY and self._observer_held.get(ws, False):
+                return
             try:
                 async with lock:
                     await ws.send_bytes(frame)
@@ -845,13 +1036,7 @@ class GameSession:
             await asyncio.gather(*(send_one_bounded(ws) for ws in target_list))
 
         for ws in dead:
-            async with self._lock:
-                self.observer_ws_set.discard(ws)
-                self._observer_send_locks.pop(ws, None)
-                self._observer_catchup_limit.pop(ws, None)
-
-        if dead:
-            mark_observer_change(self.lobby_id)
+            await self._drop_observer(ws)
 
 
 # ── In-memory state ────────────────────────────────────────────────────────
@@ -865,11 +1050,15 @@ watch_tickets: dict[str, dict] = {}
 stream_tokens: dict[str, dict] = {}
 
 
-def _new_credential(lobby_id: str, user_id, store: dict) -> str:
+def _new_credential(lobby_id: str, user_id, store: dict, priority: bool = False) -> str:
     key = secrets.token_urlsafe(24)
     store[key] = {
         "lobby_id": lobby_id,
         "user_id": user_id,
+        # Priority watchers (admin / user_priority = Viewer, decided by GO at mint time)
+        # bypass the relay's byte-level delay hold. GO stamps it on watch tickets; stream
+        # tokens never carry it (sources are not observers), so an absent value is False.
+        "priority": bool(priority),
         # The fixed short lifetime applies to every credential: the client flow is atomic
         # (mint -> send -> connect), so a short TTL is enough and keeps the replay window small.
         "expires_at": time.time() + WATCH_TICKET_TTL_SECONDS,
@@ -1169,8 +1358,10 @@ def _mint_credential(request: Request, lobby_id: str, body: dict,
                      store: dict, url_path: str, query_param: str) -> dict:
     """Mint a single-use credential and return its public connect URL."""
     user_id = body.get("user_id")
-    key = _new_credential(lobby_id, user_id, store)
-    log_debug(f"[TICKET] [INTERNAL] {query_param} minted for user_id={user_id} lobby={lobby_id}")
+    priority = bool(body.get("priority", False))
+    key = _new_credential(lobby_id, user_id, store, priority=priority)
+    log_debug(f"[TICKET] [INTERNAL] {query_param} minted for user_id={user_id} "
+              f"lobby={lobby_id} priority={priority}")
     return {"url": _public_ws_url(request, url_path, lobby_id, query_param, key)}
 
 
@@ -1431,7 +1622,8 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
     # credential is burned on first use regardless of what check rejects it, so a client can't
     # retry a ticket against a different lobby or an ended game.
     ticket = websocket.query_params.get("ticket")
-    if consume_watch_ticket(ticket, lobby_id) is None:
+    credential = consume_watch_ticket(ticket, lobby_id)
+    if credential is None:
         await reject(websocket, "Missing or invalid watch ticket")
         return
 
@@ -1440,7 +1632,11 @@ async def watch_game(websocket: WebSocket, lobby_id: str):
         await reject(websocket, "Game not found or ended")
         return
 
-    send_lock = await session.add_observer(websocket)
+    # GO stamps priority on the ticket for privileged watchers (admin / user_priority =
+    # Viewer): they bypass the byte-level delay hold and watch the live edge. Everyone
+    # else on a delayed stream is held (plans/relay/relay-server-side-delay-hold.md).
+    send_lock = await session.add_observer(websocket,
+                                           priority=bool(credential.get("priority", False)))
     if send_lock is None:
         await reject(websocket, "Max observers reached")
         return
@@ -1543,6 +1739,25 @@ async def _cleanup_loop():
                 await session._maybe_demote_source(ws)
 
 
+async def _delay_flush_loop():
+    """Deliver held observers' due body bytes on a fixed cadence.
+
+    Flush-on-append covers the common case; this catches chunks whose delay elapsed while
+    no body arrived nearby (quiet moments, appends stalled). Cheap when idle: no held
+    observers, no work.
+    """
+    while True:
+        await asyncio.sleep(DELAY_FLUSH_INTERVAL)
+        for session in list(games.values()):
+            if session.ended or not session._observer_held:
+                continue
+            try:
+                await session._flush_held_observers()
+            except Exception as e:
+                log_warn(f"[OBSERVER] [WARN] delay flush failed for game "
+                         f"{session.lobby_id}: {type(e).__name__}: {e}")
+
+
 async def _observer_report_loop():
     """Periodically flush the observer-count batch to GO.
 
@@ -1566,7 +1781,7 @@ async def _observer_report_loop():
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
-    print(f"[START] cc-live-relay v0.5.0 starting on {host}:{PORT}")
+    print(f"[START] cc-live-relay v0.6.0 starting on {host}:{PORT}")
     print(f"[START] Max observers: {MAX_OBSERVERS_PER_GAME}, Chunk size: {CHUNK_SIZE} bytes")
     if not INTERNAL_API_KEY:
         print("[START] WARNING: INTERNAL_API_KEY is not set — /internal/* endpoints will refuse all calls")

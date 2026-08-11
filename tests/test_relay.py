@@ -76,8 +76,11 @@ async def internal_post(path, payload):
             return await r.json()
 
 
-async def register_livestream(lobby_id, owner_user_id=1):
-    return await internal_post("/internal/livestreams", {"lobby_id": lobby_id, "owner_user_id": owner_user_id})
+async def register_livestream(lobby_id, owner_user_id=1, delay_seconds=None):
+    payload = {"lobby_id": lobby_id, "owner_user_id": owner_user_id}
+    if delay_seconds is not None:
+        payload["delay_seconds"] = delay_seconds
+    return await internal_post("/internal/livestreams", payload)
 
 
 async def mint_stream_token(lobby_id, user_id=1):
@@ -85,8 +88,9 @@ async def mint_stream_token(lobby_id, user_id=1):
     return data["url"].split("stream_token=")[1]
 
 
-async def mint_watch_ticket(lobby_id, user_id=9):
-    data = await internal_post("/internal/watch_tickets", {"lobby_id": lobby_id, "user_id": user_id})
+async def mint_watch_ticket(lobby_id, user_id=9, priority=False):
+    data = await internal_post("/internal/watch_tickets",
+                               {"lobby_id": lobby_id, "user_id": user_id, "priority": priority})
     return data["url"].split("ticket=")[1]
 
 
@@ -187,7 +191,8 @@ async def test_observer_receives_data():
         await sws.send(pack_frame(MSG_BODY, struct.pack('<Q', offset) + (bytes([i] * 100))))
     await asyncio.sleep(0.2)
 
-    ticket = await mint_watch_ticket("test_game_003", user_id=9)
+    # Priority ticket (no delay hold): the observer must get the body immediately.
+    ticket = await mint_watch_ticket("test_game_003", user_id=9, priority=True)
     async with websockets.connect(f"{BASE}/watch/test_game_003?ticket={ticket}") as ows:
         messages = []
         try:
@@ -302,7 +307,7 @@ async def test_dual_source_dedup():
     await asyncio.sleep(0.2)
     ok("both sources sent same BODY offset=0 (relay deduplicates)")
 
-    ticket = await mint_watch_ticket("test_game_009", user_id=9)
+    ticket = await mint_watch_ticket("test_game_009", user_id=9, priority=True)
     ows = await websockets.connect(f"{BASE}/watch/test_game_009?ticket={ticket}")
     msgs_before = []
     try:
@@ -341,6 +346,68 @@ async def test_dual_source_dedup():
     await sws_b.close()
     await ows.close()
     await asyncio.sleep(0.2)
+
+
+# ── Byte-level delay hold (plans/relay/relay-server-side-delay-hold.md) ──────
+
+async def test_held_observer_delay_edge():
+    print("\n=== Held observer: body arrives only after the broadcast delay ===")
+    await register_livestream("test_hold_001", owner_user_id=1, delay_seconds=5)
+    sws = await connect_source("test_hold_001", user_id=1)
+    await sws.send(pack_frame(MSG_HEADER, b"HEADER_HOLD"))
+    await sws.send(pack_frame(MSG_BODY, struct.pack('<Q', 0) + b"H" * 60))
+    await asyncio.sleep(0.2)
+
+    ticket = await mint_watch_ticket("test_hold_001", user_id=9, priority=False)
+    async with websockets.connect(f"{BASE}/watch/test_hold_001?ticket={ticket}") as ows:
+        role = None
+        for _ in range(5):
+            raw = await asyncio.wait_for(ows.recv(), timeout=2.0)
+            if isinstance(raw, bytes):
+                t, pl = unpack_frame(raw)
+                if t == MSG_ROLE:
+                    role = pl.decode()
+                    break
+        assert role is not None and '"delay_seconds":0' in role, f"held ROLE wrong: {role!r}"
+        ok("held observer ROLE delay_seconds: 0 (the data edge is the delay)")
+
+        # Catch-up is capped at the watermark (0 for a session younger than the delay):
+        # HEADER arrives instantly, then the socket is silent while the delay elapses —
+        # the 5 s delay gives plenty of margin over the join latency itself.
+        t, pl = unpack_frame(await asyncio.wait_for(ows.recv(), timeout=2.0))
+        assert t == MSG_HEADER, f"expected catch-up HEADER, got type={t}"
+        try:
+            await asyncio.wait_for(ows.recv(), timeout=1.0)
+            raise AssertionError("held observer got a frame within 1s of joining")
+        except asyncio.TimeoutError:
+            ok("held observer silent while the delay elapses")
+        t, pl = unpack_frame(await asyncio.wait_for(ows.recv(), timeout=8.0))
+        assert t == MSG_BODY, f"expected the delayed body, got type={t}"
+        offset = struct.unpack('<Q', pl[:8])[0]
+        assert offset == len(b"HEADER_HOLD"), f"unexpected file offset {offset}"
+        ok("held observer's body arrived once the delay elapsed")
+
+    # Priority observer on the same stream: instant full catch-up.
+    pticket = await mint_watch_ticket("test_hold_001", user_id=10, priority=True)
+    async with websockets.connect(f"{BASE}/watch/test_hold_001?ticket={pticket}") as ows:
+        role = None
+        got_body = False
+        for _ in range(10):
+            raw = await asyncio.wait_for(ows.recv(), timeout=2.0)
+            if isinstance(raw, bytes):
+                t, pl = unpack_frame(raw)
+                if t == MSG_ROLE:
+                    role = pl.decode()
+                elif t == MSG_BODY:
+                    got_body = True
+                    break
+        assert role is not None and '"delay_seconds":5' in role, f"priority ROLE wrong: {role!r}"
+        assert got_body, "priority observer should get the body immediately"
+        ok("priority observer: full body immediately, delay_seconds: 5")
+
+    await sws.send(pack_frame(MSG_END, b""))
+    await asyncio.sleep(0.2)
+    await sws.close()
 
 
 # ── Chat (MSG_CHAT / MSG_SPECTATOR_CHAT) ───────────────────────────────────
@@ -571,6 +638,7 @@ async def main():
         test_watch_ticket_single_use,
         test_ticket_wrong_lobby_rejected,
         test_dual_source_dedup,
+        test_held_observer_delay_edge,
         test_player_chat_roundtrip_dedup_history,
         test_spectator_chat_audience,
         test_spectator_chat_rate_limit,

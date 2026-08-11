@@ -83,10 +83,13 @@ def keys():
 # Test helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def register_livestream(client: TestClient, lobby_id: str, owner_user_id: int = 1) -> dict:
+def register_livestream(client: TestClient, lobby_id: str, owner_user_id: int = 1,
+                        delay_seconds: int = None) -> dict:
     """GO announces a livestream (POST /internal/livestreams). Returns the response json."""
-    r = client.post("/internal/livestreams", json={"lobby_id": lobby_id, "owner_user_id": owner_user_id},
-                    headers=keys())
+    payload = {"lobby_id": lobby_id, "owner_user_id": owner_user_id}
+    if delay_seconds is not None:
+        payload["delay_seconds"] = delay_seconds
+    r = client.post("/internal/livestreams", json=payload, headers=keys())
     assert r.status_code == 200, f"livestream register failed: {r.status_code} {r.text}"
     return r.json()
 
@@ -99,9 +102,10 @@ def mint_stream_token(client: TestClient, lobby_id: str, user_id: int) -> str:
     return r.json()["url"].split("stream_token=")[1]
 
 
-def mint_watch_ticket(client: TestClient, lobby_id: str, user_id: int) -> str:
+def mint_watch_ticket(client: TestClient, lobby_id: str, user_id: int,
+                      priority: bool = False) -> str:
     r = client.post("/internal/watch_tickets",
-                    json={"lobby_id": lobby_id, "user_id": user_id},
+                    json={"lobby_id": lobby_id, "user_id": user_id, "priority": priority},
                     headers=keys())
     assert r.status_code == 200, f"watch ticket mint failed: {r.status_code} {r.text}"
     return r.json()["url"].split("ticket=")[1]
@@ -315,6 +319,68 @@ def test_ticket_gets_configured_ttl(client: TestClient, *_):
     ok("credential expiry = now + WATCH_TICKET_TTL_SECONDS")
 
 
+def test_watch_ticket_priority_stored(client: TestClient, *_):
+    print("\n=== Watch tickets carry the GO-stamped priority flag ===")
+    register_livestream(client, "auth_mock_014", owner_user_id=1)
+    normal = mint_watch_ticket(client, "auth_mock_014", user_id=1, priority=False)
+    prio = mint_watch_ticket(client, "auth_mock_014", user_id=2, priority=True)
+    assert server.watch_tickets[normal]["priority"] is False
+    ok("normal ticket stored with priority=False")
+    assert server.watch_tickets[prio]["priority"] is True
+    ok("priority ticket stored with priority=True")
+    assert "priority" not in server.stream_tokens  # stream tokens never carry it
+    ok("stream tokens carry no priority flag")
+
+
+def test_priority_ticket_bypasses_delay_hold(client: TestClient, *_):
+    print("\n=== Priority ticket bypasses the delay hold; normal ticket is held ===")
+    register_livestream(client, "auth_mock_015", owner_user_id=1, delay_seconds=2)
+    token = mint_stream_token(client, "auth_mock_015", user_id=1)
+    with client.websocket_connect(f"/stream/auth_mock_015?stream_token={token}") as sws:
+        sws.send_bytes(pack_frame(MSG_REGISTER, json.dumps({
+            "lobbyid": "auth_mock_015",
+            "player_name": "Host15",
+            "can_stream": True,
+            "is_host": True,
+        }).encode()))
+        sws.receive_bytes()  # ROLE
+        sws.send_bytes(pack_frame(MSG_HEADER, b"HEADER_15"))
+        sws.send_bytes(pack_frame(MSG_BODY, struct.pack("<Q", 0) + b"B" * 40))
+        import time as _time
+        _time.sleep(0.2)  # let the body land before the observers join
+
+        # Normal viewer: held — ROLE delay_seconds: 0, catch-up capped at the watermark
+        # (0 for a session younger than the delay), and the body arrives on the wire only
+        # once the delay has elapsed: the blocking read below is the hold in action.
+        ticket = mint_watch_ticket(client, "auth_mock_015", user_id=9, priority=False)
+        with client.websocket_connect(f"/watch/auth_mock_015?ticket={ticket}") as ws:
+            role = receive_until(ws, MSG_ROLE)
+            assert b'"delay_seconds":0' in role, f"held ROLE should carry delay 0, got {role!r}"
+            ok("held observer ROLE delay_seconds: 0")
+            hdr = receive_until(ws, MSG_HEADER)
+            assert hdr == b"HEADER_15", f"unexpected header: {hdr!r}"
+            t, pl = unpack_frame(ws.receive_bytes())
+            assert t == MSG_BODY and pl[:8] == struct.pack('<Q', 9), \
+                f"expected the delayed body at file offset 9, got type={t} pl={pl[:16]!r}"
+            ok("held observer's body arrived only after the delay (byte-level hold)")
+
+        # Priority viewer: instant — full catch-up body, session delay in the ROLE.
+        pticket = mint_watch_ticket(client, "auth_mock_015", user_id=10, priority=True)
+        with client.websocket_connect(f"/watch/auth_mock_015?ticket={pticket}") as ws:
+            role = receive_until(ws, MSG_ROLE)
+            assert b'"delay_seconds":2' in role, f"priority ROLE should carry delay 2, got {role!r}"
+            ok("priority observer ROLE delay_seconds: 2")
+            got_body = False
+            for _ in range(6):
+                raw = ws.receive_bytes()
+                t, pl = unpack_frame(raw)
+                if t == MSG_BODY:
+                    got_body = True
+                    break
+            assert got_body, "priority observer should get the body immediately"
+            ok("priority observer received the body immediately (bypass)")
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Runner
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,6 +409,8 @@ def main():
             test_health_open,
             test_removed_endpoints_gone,
             test_ticket_gets_configured_ttl,
+            test_watch_ticket_priority_stored,
+            test_priority_ticket_bypasses_delay_hold,
         ]
 
         for test in tests:

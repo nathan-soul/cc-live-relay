@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
-from server import GameSession, MSG_ROLE, MSG_HEADER, MSG_BODY
+from server import GameSession, MSG_ROLE, MSG_HEADER, MSG_BODY, MSG_END
 
 PASS = 0
 FAIL = 0
@@ -86,17 +86,55 @@ def new_session():
     return session
 
 
+class FakeClock:
+    """Deterministic replacement for server.time.time in delay-hold tests.
+
+    Installed with ClockPatch; every time.time() call inside the relay then reads
+    clock.now, so arrival stamps, watermarks and flush deadlines are all exact.
+    """
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def tick(self, dt: float) -> None:
+        self.now += dt
+
+
+class ClockPatch:
+    """Context manager swapping server.time.time for a FakeClock, restored on exit."""
+
+    def __init__(self, clock: FakeClock):
+        self.clock = clock
+        self._real = server.time.time
+
+    def __enter__(self):
+        server.time.time = self.clock
+
+    def __exit__(self, *exc):
+        server.time.time = self._real
+
+
+async def append_at(session, clock, ts, size=LIVE_CHUNK):
+    """Append one body chunk with the clock at exactly `ts` (records an arrival stamp)."""
+    clock.now = ts
+    await session.apply_body(None, struct.pack("<Q", len(session.body)) + b"B" * size)
+
+
 async def test_join_then_append():
     """Observer joins; a live chunk is appended while catch-up is still pending.
 
     Without the send-lock handoff in add_observer(), the live chunk overtakes catch-up and
-    the observer writes it past a hole.
+    the observer writes it past a hole. Uses a priority observer (no delay hold) so the
+    test isolates the lock machinery from the hold.
     """
     print("\ntest_join_then_append")
     session = new_session()
     ws = FakeWS()
 
-    send_lock = await session.add_observer(ws)
+    send_lock = await session.add_observer(ws, priority=True)
     check("add_observer returns a held lock", send_lock is not None and send_lock.locked())
 
     broadcast = asyncio.create_task(
@@ -130,13 +168,149 @@ async def test_append_then_join():
 
     await session.apply_body(ws, struct.pack("<Q", INITIAL_BODY) + b"B" * LIVE_CHUNK)
 
-    send_lock = await session.add_observer(ws)
+    send_lock = await session.add_observer(ws, priority=True)
     try:
         await session.send_catchup(ws, last_offset=0, held_lock=send_lock)
     finally:
         send_lock.release()
 
     check_exactly_once("body delivered exactly once", ws, INITIAL_BODY + LIVE_CHUNK)
+
+
+# ── Byte-level delay hold (plans/relay/relay-server-side-delay-hold.md) ──────
+
+async def test_delayed_watermark():
+    """delayed_watermark returns the body length as of now - delay."""
+    print("\ntest_delayed_watermark")
+    session = GameSession("wm")
+    session.body.extend(b"B" * 100)
+    session.delay_seconds = DELAY_SECONDS
+    for i in range(5):
+        session._record_body_history(1010 + i * 10, 20 + i * 20)
+
+    check("younger than delay -> 0", session.delayed_watermark(1042) == 0)
+    check("cutoff at first entry", session.delayed_watermark(1052) == 20)
+    check("cutoff between entries", session.delayed_watermark(1065) == 40)
+    check("cutoff past last entry", session.delayed_watermark(1099) == 100)
+
+    session.delay_seconds = 0
+    check("delay 0 -> live edge", session.delayed_watermark(1042) == len(session.body))
+
+
+async def test_held_observer_join_and_live_chunks():
+    """A held observer starts at the delayed edge; younger bytes arrive at +delay."""
+    print("\ntest_held_observer_join_and_live_chunks")
+    clock = FakeClock()
+    with ClockPatch(clock):
+        session = GameSession("held")
+        session.header[:] = b"H" * HEADER_LEN
+        session.header_received = True
+        session.delay_seconds = DELAY_SECONDS
+
+        # Five chunks recorded at t=1000..1008 (body = 100), observer joins at t=1010.
+        for i in range(5):
+            await append_at(session, clock, 1000 + (i + 1) * 2)
+        ws = FakeWS()
+        send_lock = await session.add_observer(ws, priority=False)
+        try:
+            await session.send_catchup(ws, last_offset=0, held_lock=send_lock)
+        finally:
+            send_lock.release()
+
+        check("observer is held", session._observer_held.get(ws, False))
+        role = ws.frames[0][1].decode()
+        check("held ROLE carries delay_seconds: 0", f'"delay_seconds":0' in role, role)
+        check("no body in held catch-up", [t for t, _ in ws.frames if t == MSG_BODY] == [])
+
+        # A chunk appended after join (t=1012, ready t=1054) must not be delivered yet.
+        await append_at(session, clock, 1012)
+        check("younger-than-delay chunk not delivered",
+              [t for t, _ in ws.frames if t == MSG_BODY] == [])
+
+        # The shared edge advances with the clock: watermark(1043) = 20, (1045) = 40 ...
+        clock.tick(33)
+        await session._flush_held_observers()
+        clock.tick(2)
+        await session._flush_held_observers()
+        clock.tick(5)
+        await session._flush_held_observers()
+        check_exactly_once("delayed edge delivered 0-100", ws, 100)
+
+        # The post-join chunk becomes available at its own arrival + delay (1054).
+        clock.now = 1055
+        await session._flush_held_observers()
+        check_exactly_once("all 120 bytes delivered exactly once", ws, 120)
+
+
+async def test_priority_observer_not_held():
+    """A priority observer bypasses the hold: full catch-up, live chunks immediate."""
+    print("\ntest_priority_observer_not_held")
+    clock = FakeClock()
+    with ClockPatch(clock):
+        session = GameSession("prio")
+        session.header[:] = b"H" * HEADER_LEN
+        session.header_received = True
+        session.delay_seconds = DELAY_SECONDS
+        for i in range(5):
+            await append_at(session, clock, 1000 + (i + 1) * 2)
+
+        ws = FakeWS()
+        send_lock = await session.add_observer(ws, priority=True)
+        try:
+            await session.send_catchup(ws, last_offset=0, held_lock=send_lock)
+        finally:
+            send_lock.release()
+
+        check("priority observer not held", not session._observer_held.get(ws, False))
+        check("priority ROLE keeps delay_seconds",
+              f'"delay_seconds":{DELAY_SECONDS}' in ws.frames[0][1].decode())
+        await append_at(session, clock, 1012)
+        check_exactly_once("priority observer got everything immediately", ws, 120)
+
+
+async def test_held_observer_end_flush():
+    """Stream end flushes a held observer's remaining bytes immediately."""
+    print("\ntest_held_observer_end_flush")
+    clock = FakeClock()
+    with ClockPatch(clock):
+        session = GameSession("endflush")
+        session.header[:] = b"H" * HEADER_LEN
+        session.header_received = True
+        session.delay_seconds = DELAY_SECONDS
+        for i in range(5):
+            await append_at(session, clock, 1000 + (i + 1) * 2)
+
+        ws = FakeWS()
+        send_lock = await session.add_observer(ws, priority=False)
+        try:
+            await session.send_catchup(ws, last_offset=0, held_lock=send_lock)
+        finally:
+            send_lock.release()
+
+        await append_at(session, clock, 1012)   # not yet due (ready at 1054)
+        await session._broadcast_envelope(MSG_END, b"", targets=[ws])
+
+        check_exactly_once("END flushed the whole body", ws, 120)
+        check("END frame sent after the flush",
+              [t for t, _ in ws.frames].count(MSG_END) == 1)
+
+
+async def test_delay_zero_not_held():
+    """A delay-0 session holds nobody, even without a priority ticket."""
+    print("\ntest_delay_zero_not_held")
+    session = new_session()
+    session.delay_seconds = 0
+    ws = FakeWS()
+
+    send_lock = await session.add_observer(ws, priority=False)
+    check("delay 0 -> not held", not session._observer_held.get(ws, False))
+    try:
+        await session.send_catchup(ws, last_offset=0, held_lock=send_lock)
+    finally:
+        send_lock.release()
+
+    await session.apply_body(ws, struct.pack("<Q", INITIAL_BODY) + b"B" * LIVE_CHUNK)
+    check_exactly_once("delay 0 -> everything delivered", ws, INITIAL_BODY + LIVE_CHUNK)
 
 
 # ── All-push demotion / re-promotion (plans/relay/streamer-allpush-demotion.md) ──
@@ -313,6 +487,11 @@ async def test_no_promotion_when_active_remains():
 async def main():
     await test_join_then_append()
     await test_append_then_join()
+    await test_delayed_watermark()
+    await test_held_observer_join_and_live_chunks()
+    await test_priority_observer_not_held()
+    await test_held_observer_end_flush()
+    await test_delay_zero_not_held()
     await test_demote_on_lag_threshold()
     await test_demote_on_gap_strikes()
     await test_never_demote_last_active_source()
