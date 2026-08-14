@@ -37,6 +37,13 @@ MSG_ROLE     = 5
 MSG_ERROR    = 6
 MSG_CHAT     = 7
 MSG_SPECTATOR_CHAT = 8
+# Frame heartbeat (plans/relay/live-observer-frame-heartbeat.md): the source's current logic
+# frame, [frame u32 LE]. The replay body only contains records for frames that have input, so
+# in quiet play it is silent apart from one CRC record every ~1.7 s; an observer deriving the
+# live edge from those records learns where the game is in 1.7 s jumps and starves between
+# them. The tick states the frame directly. It is opaque to the relay, which forwards it and
+# remembers the latest value for observers joining later.
+MSG_TICK     = 9
 
 CHUNK_SIZE = 256 * 1024  # 256 KB per chunk for observer catch-up
 
@@ -201,13 +208,37 @@ async def lifespan(app: FastAPI):
             task.cancel()
         await asyncio.gather(*background, return_exceptions=True)
 
+        # The relay is going down (deploy/restart/stop). Every healthy session is being
+        # torn out from under its clients, so tell them: sources get an ERROR frame and
+        # their sockets closed (a graceful game end never looks like this), observers get
+        # the same ERROR so they can show "stream lost" in-game instead of waiting out
+        # their own watchdog on a dead socket. Never raises — shutdown must not fail.
+        for session in list(games.values()):
+            if session.ended:
+                continue
+            try:
+                reason_json = json.dumps({"reason": "relay-shutdown",
+                                          "msg": "relay is going down"},
+                                         separators=(',', ':'))
+                await session._broadcast_envelope(MSG_ERROR, reason_json.encode())
+            except Exception:
+                pass
+            for ws in list(session.sources):
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+        if games:
+            log_warn(f"[LIVESTREAMER] [SHUTDOWN] Relay shutting down with {len(games)} live "
+                     f"session(s); notified their observers and sources")
+
         # Close the shared outbound session so the process exits cleanly.
         if _go_notify_session is not None:
             await _go_notify_session.close()
             _go_notify_session = None
 
 
-app = FastAPI(title="cc-live-relay", version="0.6.0", lifespan=lifespan)
+app = FastAPI(title="cc-live-relay", version="0.7.0", lifespan=lifespan)
 
 
 # ── Binary envelope helpers ────────────────────────────────────────────────
@@ -371,6 +402,11 @@ class GameSession:
         self._body_history: deque = deque()
         # Last count actually posted to GO, so unchanged sessions skip redundant posts.
         self._last_reported_observers: Optional[int] = None
+        # Newest frame heartbeat seen from any source (MSG_TICK). Kept so an observer that
+        # joins between ticks gets the live edge immediately instead of waiting for the next
+        # one. Monotonic: several sources push the same stream and a laggier one must never
+        # drag the edge backwards.
+        self.last_tick_frame: int = 0
 
     # ── Data ingestion (called from source loop) ─────────────────────────
 
@@ -556,6 +592,33 @@ class GameSession:
             # append happens for a while.
             await self._flush_held_observers()
 
+    async def apply_tick(self, ws: WebSocket, payload: bytes) -> None:
+        """Frame heartbeat from a source: record it and forward to live-edge observers.
+
+        Carries no game data — only the source's current logic frame — so there is nothing
+        to store in the body and nothing to catch up. The value's whole worth is that the
+        source sent it *after* flushing that frame's records, which on an ordered transport
+        makes it a proof rather than an estimate.
+        """
+        if self._source_demoted(ws):
+            return
+        if len(payload) < 4:
+            log_warn(f"[LIVESTREAMER] [WARN] TICK payload too short: {len(payload)} bytes")
+            return
+
+        frame = struct.unpack('<I', payload[0:4])[0]
+
+        async with self._lock:
+            # Monotonic. All-push means several sources forward the same stream, and a source
+            # running behind would otherwise pull the advertised edge back — an observer that
+            # already simulated to the higher frame cannot un-simulate it.
+            if frame <= self.last_tick_frame:
+                return
+            self.last_tick_frame = frame
+            targets = list(self.observer_ws_set)
+
+        await self._broadcast_envelope(MSG_TICK, payload, targets=targets)
+
     # ── Chat (plans/relay/live-observer-chat.md + live-observer-spectator-chat.md) ──
 
     async def apply_chat(self, ws: WebSocket, payload: bytes) -> None:
@@ -670,6 +733,19 @@ class GameSession:
         if should_broadcast_end:
             self.save_replay()
             await self._broadcast_envelope(MSG_END, b'')
+        elif ended_here:
+            # Last source gone WITHOUT an END frame: the streamer died or its connection
+            # dropped mid-game. That is a disaster, not a game end — tell any observers
+            # still watching so they can show "stream lost" in-game instead of waiting
+            # out their own watchdog.
+            if self.observer_ws_set:
+                try:
+                    reason_json = json.dumps({"reason": "sources-gone",
+                                              "msg": "all streamers disconnected"},
+                                             separators=(',', ':'))
+                    await self._broadcast_envelope(MSG_ERROR, reason_json.encode())
+                except Exception:
+                    pass
         # The relay owns closing a stream: when it observes the last source leave (with or
         # without END), it flags the stream ended so the next batch tells GO to stop listing
         # the livestream. This is the only teardown signal — GO has no endpoint to close a
@@ -857,6 +933,7 @@ class GameSession:
             header_snapshot = bytes(self.header)
             ended_snapshot = self.ended
             held = self._observer_held.get(ws, False)
+            tick_snapshot = self.last_tick_frame
             # Held observers get delay_seconds: 0 — the relay's byte-level hold IS the
             # delay, and the client must not double-hold on top of it. Old clients that
             # do not know about the hold play at the held edge correctly either way.
@@ -884,6 +961,13 @@ class GameSession:
             chunk = body_slice[chunk_off:chunk_off + CHUNK_SIZE]
             chunk_payload = struct.pack('<Q', header_size + last_offset + chunk_off) + chunk
             await ws.send_bytes(pack_frame(MSG_BODY, chunk_payload))
+
+        # Frame heartbeat for the joining observer, after the body it belongs to. Ticks are
+        # broadcast, not stored, so without this a joiner would sit on the record-derived
+        # edge until the next one arrives. Held observers are excluded for the same reason
+        # they are excluded from live ticks (see _broadcast_envelope).
+        if tick_snapshot and not held:
+            await ws.send_bytes(pack_frame(MSG_TICK, struct.pack('<I', tick_snapshot)))
 
         if ended_snapshot:
             if held:
@@ -1004,7 +1088,13 @@ class GameSession:
             # Held observers are served by the shared delayed edge, never a live chunk.
             # Their pointer advances to the watermark at arrival + delay; sending the
             # chunk directly here would put younger-than-delay bytes in their file.
-            if msg_type == MSG_BODY and self._observer_held.get(ws, False):
+            #
+            # MSG_TICK is withheld from them for the same reason one step removed: it
+            # carries no bytes, but it advertises the live edge, and the delay hold exists
+            # precisely so a modified client cannot know — let alone reach — data younger
+            # than the delay. A held observer's edge is the delayed byte edge it is being
+            # fed, which is what it already derives from the records themselves.
+            if msg_type in (MSG_BODY, MSG_TICK) and self._observer_held.get(ws, False):
                 return
             try:
                 async with lock:
@@ -1581,6 +1671,8 @@ async def _source_loop(ws: WebSocket, session: GameSession) -> None:
             await session.apply_patch(ws, payload)
         elif msg_type == MSG_BODY:
             await session.apply_body(ws, payload)
+        elif msg_type == MSG_TICK:
+            await session.apply_tick(ws, payload)
         elif msg_type == MSG_CHAT:
             await session.apply_chat(ws, payload)
         elif msg_type == MSG_SPECTATOR_CHAT:
@@ -1689,10 +1781,37 @@ async def _cleanup_loop():
             for k in expired:
                 store.pop(k, None)
 
+        # Zombie-source probe: the rules above never reap a session with connected sources,
+        # so a source whose TCP connection died without a disconnect event would keep its
+        # session alive forever. Probe silent sources and drop the dead ones — a live but
+        # idle streamer (a stalled game) answers the ping fine and stays.
+        for session in list(games.values()):
+            if session.ended or not session.sources:
+                continue
+            if now - session.last_active <= INACTIVE_GAME_TTL:
+                continue
+            for ws in list(session.sources):
+                try:
+                    await asyncio.wait_for(ws.ping(), timeout=5)
+                except Exception:
+                    log_warn(f"[LIVESTREAMER] [CLEANUP] Game {session.lobby_id}: source "
+                             f"{id(ws):x} silent for {int(now - session.last_active)}s and "
+                             f"unresponsive to ping — removing it")
+                    await session.remove_source(ws)
+
         to_remove = []
         notify_reasons = {}
         for lobby_id, session in games.items():
-            if session.ended or (now - session.last_active > INACTIVE_GAME_TTL):
+            # A session with connected sources is alive even when idle: the game may be
+            # paused/stalled (the streamer's socket is open and it believes it is
+            # streaming), and reaping it would kill the watch for every observer while the
+            # streamer keeps uploading into a dead session — the "UI says streaming but
+            # /health says no stream" failure. Inactivity only reaps sessions nobody is
+            # connected to anymore (a source that vanished without a disconnect event, or
+            # a session that was created but never claimed).
+            idle_without_sources = (not session.sources
+                                    and now - session.last_active > INACTIVE_GAME_TTL)
+            if session.ended or idle_without_sources:
                 to_remove.append(lobby_id)
                 # A session already marked `ended` was closed by remove_source, which already
                 # notified GO. A session reaped purely for inactivity was never closed by a
@@ -1701,25 +1820,62 @@ async def _cleanup_loop():
                     notify_reasons[lobby_id] = "inactivity"
                 continue
 
-            # A session nobody ever claimed as host can never be listed or watched, but an
-            # active non-host source keeps last_active fresh forever, so the inactivity TTL
-            # above never reaches it. Bound the wasted upload rather than letting it run for
-            # the whole match.
-            if not session.lobby and (now - session.created_at > UNDESCRIBED_GAME_TTL):
-                log_warn(f"[LIVESTREAMER] [CLEANUP] No host registration for {lobby_id} after "
-                         f"{UNDESCRIBED_GAME_TTL}s; dropping (host not streaming?)")
-                to_remove.append(lobby_id)
-                notify_reasons[lobby_id] = "undescribed"
+        # A session nobody ever described as host (the host's REGISTER carries the lobby
+        # block) is dropped once it is clearly abandoned — but only while no source is
+        # connected. A non-host source streaming without the host is alive and watchable
+        # (the is_live report fires on any header), so reaping it at 120s just because the
+        # host chose not to stream would kill a working watch — the streamers would keep
+        # "streaming" into a dead session with /health showing nothing.
+        if not session.lobby and not session.sources \
+                and (now - session.created_at > UNDESCRIBED_GAME_TTL):
+            log_warn(f"[LIVESTREAMER] [CLEANUP] No host registration for {lobby_id} after "
+                     f"{UNDESCRIBED_GAME_TTL}s; dropping (host not streaming?)")
+            to_remove.append(lobby_id)
+            notify_reasons[lobby_id] = "undescribed"
 
         for lobby_id in to_remove:
             session = games.pop(lobby_id, None)
             if session:
+                reason = notify_reasons.get(lobby_id)
+                # If sources are still connected when the session goes away (defensive —
+                # the inactivity rule above normally prevents this), they would keep
+                # uploading into a reaped session forever and show "streaming" with no
+                # stream anywhere. Tell them, loudly, and close their sockets so the
+                # client winds down instead of hanging.
+                if session.sources:
+                    log_warn(f"[LIVESTREAMER] [CLEANUP] Game {lobby_id} removed with "
+                             f"{len(session.sources)} source(s) still connected"
+                             f" (reason={reason or 'ended'}) — notifying and closing them")
+                    for ws in list(session.sources):
+                        try:
+                            reason_json = json.dumps({"reason": reason or "session_ended"},
+                                                     separators=(',', ':'))
+                            await ws.send_bytes(pack_frame(MSG_ERROR, reason_json.encode()))
+                        except Exception:
+                            pass
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                # A reap is a disaster, not a game end: the streamer never sent END. Tell
+                # any observers still attached so they can show "stream lost" in-game
+                # instead of finishing as if the match had ended normally.
+                if reason and session.observer_ws_set:
+                    try:
+                        reason_json = json.dumps(
+                            {"reason": reason, "msg": "relay ended the session"},
+                            separators=(',', ':'))
+                        await session._broadcast_envelope(MSG_ERROR, reason_json.encode())
+                    except Exception:
+                        pass
                 try:
                     await session._broadcast_envelope(MSG_END, b'')
                 except Exception:
                     pass
-                log_debug(f"[LIVESTREAMER] [CLEANUP] Removed game {lobby_id}")
-                reason = notify_reasons.get(lobby_id)
+                log_warn(f"[LIVESTREAMER] [CLEANUP] Removed game {lobby_id}"
+                         f" (reason={reason or 'ended'}, sources={len(session.sources)},"
+                         f" observers={len(session.observer_ws_set)},"
+                         f" body={len(session.body)}B)")
                 # A session already marked `ended` was closed by remove_source, which already
                 # flagged it for an is_live=False report. A session reaped purely for
                 # inactivity/undescribed was never closed by a source disconnect, so the relay
@@ -1781,7 +1937,7 @@ async def _observer_report_loop():
 if __name__ == "__main__":
     import uvicorn
     host = os.getenv("HOST", "0.0.0.0")
-    print(f"[START] cc-live-relay v0.6.0 starting on {host}:{PORT}")
+    print(f"[START] cc-live-relay v0.7.0 starting on {host}:{PORT}")
     print(f"[START] Max observers: {MAX_OBSERVERS_PER_GAME}, Chunk size: {CHUNK_SIZE} bytes")
     if not INTERNAL_API_KEY:
         print("[START] WARNING: INTERNAL_API_KEY is not set — /internal/* endpoints will refuse all calls")

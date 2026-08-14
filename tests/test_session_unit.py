@@ -21,7 +21,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import server
-from server import GameSession, MSG_ROLE, MSG_HEADER, MSG_BODY, MSG_END
+from server import GameSession, MSG_ROLE, MSG_HEADER, MSG_BODY, MSG_END, MSG_TICK
 
 PASS = 0
 FAIL = 0
@@ -313,6 +313,120 @@ async def test_delay_zero_not_held():
     check_exactly_once("delay 0 -> everything delivered", ws, INITIAL_BODY + LIVE_CHUNK)
 
 
+# ── Frame heartbeat (MSG_TICK) ──────────────────────────────────────────────
+#
+# The tick tells an observer where the live game is without waiting for a record to show up
+# in the body. Two properties matter and neither is visible from the byte stream, so they are
+# tested here: it must not reach a delay-held observer (that observer is deliberately kept
+# ignorant of the live edge), and it must never move backwards (several sources push the same
+# stream, and an observer cannot un-simulate a frame it already ran).
+
+
+def tick_frames(ws):
+    """Frame numbers of the MSG_TICK frames delivered to ws, in order."""
+    return [struct.unpack("<I", payload[:4])[0]
+            for msg_type, payload in ws.frames if msg_type == MSG_TICK]
+
+
+async def test_tick_forwarded_to_live_observer():
+    """A live-edge observer receives ticks as they arrive."""
+    print("\ntest_tick_forwarded_to_live_observer")
+    session = new_session()
+    session.delay_seconds = 0
+    ws = FakeWS()
+
+    send_lock = await session.add_observer(ws, priority=False)
+    send_lock.release()
+
+    await session.apply_tick(None, struct.pack("<I", 600))
+    await session.apply_tick(None, struct.pack("<I", 610))
+
+    check("ticks forwarded", tick_frames(ws) == [600, 610], tick_frames(ws))
+    check("session remembers newest", session.last_tick_frame == 610)
+
+
+async def test_tick_not_forwarded_to_held_observer():
+    """A delay-held observer must not learn the live edge.
+
+    The byte-level hold exists so a modified client cannot reach data younger than the
+    delay. A tick carries no bytes, but it would hand over the very thing the hold is
+    withholding: knowledge of where live is.
+    """
+    print("\ntest_tick_not_forwarded_to_held_observer")
+    session = new_session()
+    session.delay_seconds = DELAY_SECONDS
+    ws = FakeWS()
+
+    send_lock = await session.add_observer(ws, priority=False)
+    send_lock.release()
+    check("observer is held", session._observer_held.get(ws, False))
+
+    await session.apply_tick(None, struct.pack("<I", 600))
+
+    check("no tick delivered to held observer", tick_frames(ws) == [], tick_frames(ws))
+    check("session still records it", session.last_tick_frame == 600)
+
+
+async def test_tick_monotonic():
+    """A stale tick from a lagging source never drags the advertised edge backwards."""
+    print("\ntest_tick_monotonic")
+    session = new_session()
+    session.delay_seconds = 0
+    ws = FakeWS()
+
+    send_lock = await session.add_observer(ws, priority=False)
+    send_lock.release()
+
+    await session.apply_tick(None, struct.pack("<I", 900))
+    await session.apply_tick(None, struct.pack("<I", 800))   # laggier source
+    await session.apply_tick(None, struct.pack("<I", 900))   # duplicate
+
+    check("only the forward tick forwarded", tick_frames(ws) == [900], tick_frames(ws))
+    check("edge stays at the max", session.last_tick_frame == 900)
+
+
+async def test_tick_in_catchup():
+    """A joining observer gets the current edge immediately, after its catch-up body."""
+    print("\ntest_tick_in_catchup")
+    session = new_session()
+    session.delay_seconds = 0
+    await session.apply_tick(None, struct.pack("<I", 750))
+
+    ws = FakeWS()
+    send_lock = await session.add_observer(ws, priority=False)
+    try:
+        await session.send_catchup(ws, last_offset=0, held_lock=send_lock)
+    finally:
+        send_lock.release()
+
+    check("catch-up carries the edge", tick_frames(ws) == [750], tick_frames(ws))
+
+    # After the body it belongs to: a tick ahead of its records would assert an edge for
+    # bytes the observer has not been given yet.
+    types = [msg_type for msg_type, _ in ws.frames]
+    check("tick follows the catch-up body",
+          MSG_BODY in types and types.index(MSG_TICK) > max(
+              i for i, t in enumerate(types) if t == MSG_BODY))
+
+
+async def test_tick_ignored_from_demoted_source():
+    """A demoted source has stopped pushing body data, so its edge claim is meaningless."""
+    print("\ntest_tick_ignored_from_demoted_source")
+    session = new_session()
+    session.delay_seconds = 0
+    ws = FakeWS()
+    send_lock = await session.add_observer(ws, priority=False)
+    send_lock.release()
+
+    src = register_source(session, "A")
+    session._source_health[src]["demoted"] = True
+
+    await session.apply_tick(src, struct.pack("<I", 600))
+
+    check("demoted source's tick dropped", tick_frames(ws) == [], tick_frames(ws))
+    check("edge unchanged", session.last_tick_frame == 0)
+
+
 # ── All-push demotion / re-promotion (plans/relay/streamer-allpush-demotion.md) ──
 
 def register_source(session, name):
@@ -492,6 +606,11 @@ async def main():
     await test_priority_observer_not_held()
     await test_held_observer_end_flush()
     await test_delay_zero_not_held()
+    await test_tick_forwarded_to_live_observer()
+    await test_tick_not_forwarded_to_held_observer()
+    await test_tick_monotonic()
+    await test_tick_in_catchup()
+    await test_tick_ignored_from_demoted_source()
     await test_demote_on_lag_threshold()
     await test_demote_on_gap_strikes()
     await test_never_demote_last_active_source()
