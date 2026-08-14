@@ -1,0 +1,4 @@
+# The repo is authored on Windows but builds inside a Linux container (see Dockerfile), so
+# keep LF in the working tree as well as in the index — otherwise a fresh checkout flips
+# every file to CRLF and copies that into the image.
+* text=auto eol=lf

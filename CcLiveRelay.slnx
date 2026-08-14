@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/CcLiveRelay/CcLiveRelay.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/CcLiveRelay.Tests/CcLiveRelay.Tests.csproj" />
+  </Folder>
+</Solution>

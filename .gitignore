@@ -1,0 +1,24 @@
+## .NET build output
+bin/
+obj/
+TestResults/
+*.user
+
+## IDE
+.vs/
+.vscode/
+.idea/
+
+## Docker / env
+.env
+*.dmp
+
+## Runtime data (the compose file mounts ./replays into the container)
+replays/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Design docs (kept locally, never committed)
+plans/

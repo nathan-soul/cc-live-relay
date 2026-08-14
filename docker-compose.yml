@@ -1,0 +1,37 @@
+services:
+  relay:
+    build: .
+    image: cc-live-relay:latest
+    container_name: cc-live-relay
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    environment:
+      # The relay binds HOST:PORT itself.
+      HOST: "0.0.0.0"
+      PORT: "8765"
+      # GO's credential to call this relay (sent as X-Relay-Key on /internal/*). Required:
+      # without it the internal endpoints refuse all calls (503). Set it in .env.
+      INTERNAL_API_KEY: "${INTERNAL_API_KEY:?set INTERNAL_API_KEY in .env}"
+      # The relay's own credential for outbound calls to GO (X-Relay-Key on POST /observers).
+      GO_API_KEY: "${GO_API_KEY:-}"
+      # Where GO receives the batched livestream-state updates. Empty = relay never reports.
+      GO_OBSERVERS_URL: "${GO_OBSERVERS_URL:-}"
+      # Public scheme/host used when building the connect URLs handed to clients.
+      PUBLIC_HOST: "${PUBLIC_HOST:-}"
+      PUBLIC_WS_SCHEME: "${PUBLIC_WS_SCHEME:-wss}"
+      PUBLIC_PATH_PREFIX: "${PUBLIC_PATH_PREFIX:-}"
+      # Optional tuning.
+      MAX_OBSERVERS_PER_GAME: "${MAX_OBSERVERS_PER_GAME:-1000}"
+      OBSERVER_QUEUE_FRAMES: "${OBSERVER_QUEUE_FRAMES:-1024}"
+      DEFAULT_DELAY_SECONDS: "${DEFAULT_DELAY_SECONDS:-15}"
+      DEBUG: "${DEBUG:-}"
+    volumes:
+      # Saved replays land here.
+      - ./replays:/app/replays
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8765/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
