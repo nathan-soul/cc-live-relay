@@ -47,8 +47,10 @@ public sealed partial class GameSession
                 // withheld from them for the same reason one step removed: it carries no
                 // bytes, but it advertises the live edge, and the delay hold exists precisely
                 // so a modified client cannot know — let alone reach — data younger than the
-                // delay.
-                if (msgType is MsgBody or MsgTick && IsHeld(ws))
+                // delay. MSG_STATS is the same argument again: the source's logic rate and ping
+                // describe the match *now*, so a live one would be a liveness oracle for a
+                // modified client. All three reach held observers from the delayed flush path.
+                if (msgType is MsgBody or MsgTick or MsgStats && IsHeld(ws))
                     continue;
                 EnqueueObserverFrame(ws, frame);
             }

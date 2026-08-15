@@ -72,6 +72,7 @@ public sealed partial class GameSession
         _observerHeld.Remove(ws);
         _observerLastFlushAt.Remove(ws);
         _observerLastSentTick.Remove(ws);
+        _observerLastSentStats.Remove(ws);
         _spectatorRate.Remove(ws);
         // Wake the watch loop (blocked in ReceiveAsync) so the endpoint winds down.
         _ = Task.Run(async () =>
@@ -98,6 +99,7 @@ public sealed partial class GameSession
         bool endedSnapshot;
         bool held;
         uint tickSnapshot;
+        byte[] statsSnapshot;
         int delaySnapshot;
         long limit;
         byte[] bodySnapshot;
@@ -111,8 +113,13 @@ public sealed partial class GameSession
             // frame - exactly what the byte hold exists to withhold); it gets whatever tick was
             // current as of now-delay instead, same boundary as its body catch-up slice below.
             tickSnapshot = held ? DelayedTickFrame(catchupNow) : _lastTickFrame;
+            statsSnapshot = held ? DelayedStats(catchupNow) : _lastStats;
             if (held)
+            {
                 _observerLastSentTick[ws] = tickSnapshot;
+                if (statsSnapshot.Length > 0)
+                    _observerLastSentStats[ws] = statsSnapshot;
+            }
             // Held observers get delay_seconds: 0 — the relay's byte-level hold IS the delay,
             // and the client must not double-hold on top of it.
             delaySnapshot = held ? 0 : _delaySeconds;
@@ -161,6 +168,15 @@ public sealed partial class GameSession
         if (tickSnapshot != 0)
         {
             if (!EnqueueObserverFrame(ws, BinaryEnvelope.Pack(MsgTick, BinaryEnvelope.PackU32(tickSnapshot))))
+                return;
+        }
+
+        // Telemetry for the joining observer. Sent on change, so without this its readout would
+        // stay blank until the source's next change or heartbeat - up to several seconds of a
+        // counter that looks broken rather than merely new.
+        if (statsSnapshot.Length > 0)
+        {
+            if (!EnqueueObserverFrame(ws, BinaryEnvelope.Pack(MsgStats, statsSnapshot)))
                 return;
         }
 
@@ -300,6 +316,70 @@ public sealed partial class GameSession
         }
     }
 
+    private readonly struct StatsHistoryEntry(double timestamp, byte[] payload)
+    {
+        public readonly double Timestamp = timestamp;
+        public readonly byte[] Payload = payload;
+    }
+
+    /// <summary>
+    /// Arrival-time history of the source's telemetry (MSG_STATS), mirroring _tickHistory. Held
+    /// observers must not see the live value for the same reason they must not see the live tick:
+    /// it describes the match *now*, which is precisely what the byte-level hold withholds, and a
+    /// modified client could poll it as a liveness oracle. DelayedStats applies the identical
+    /// now-delay cutoff the body bytes get, so a held observer only ever learns what it could
+    /// already have derived from the bytes it is legitimately receiving.
+    /// </summary>
+    private readonly List<StatsHistoryEntry> _statsHistory = [];
+
+    private void _recordStatsHistory(double ts, byte[] payload)
+    {
+        _statsHistory.Add(new StatsHistoryEntry(ts, payload));
+        double cutoff = ts - 2 * _options.MaxDelaySeconds;
+        int trim = 0;
+        while (trim < _statsHistory.Count - 1 && _statsHistory[trim].Timestamp < cutoff)
+            trim++;
+        if (trim > 0)
+            _statsHistory.RemoveRange(0, trim);
+        while (_statsHistory.Count > _options.BodyHistoryMax)
+            _statsHistory.RemoveAt(0);
+    }
+
+    /// <summary>The telemetry payload as of `now - delay`: the same lookup as DelayedTickFrame,
+    /// against stats arrivals. Empty means nothing has qualified yet, which the caller must treat
+    /// as "say nothing" - an observer showing a fabricated zero would be worse than one showing
+    /// no reading at all.</summary>
+    public byte[] DelayedStats(double now)
+    {
+        lock (_sync)
+        {
+            if (_delaySeconds <= 0)
+                return _lastStats;
+            double cutoff = now - _delaySeconds;
+            var hist = _statsHistory;
+            if (hist.Count == 0 || hist[0].Timestamp > cutoff)
+                return [];
+            if (hist[^1].Timestamp <= cutoff)
+                return hist[^1].Payload;
+            int lo = 0, hi = hist.Count - 1;
+            while (lo < hi)
+            {
+                int mid = (lo + hi + 1) / 2;
+                if (hist[mid].Timestamp <= cutoff)
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            return hist[lo].Payload;
+        }
+    }
+
+    /// <summary>Last telemetry payload delivered to each held observer, so the flush only enqueues
+    /// MSG_STATS when the delayed value actually changes - the send-on-change property the source
+    /// establishes has to survive the delay hold, or the hold would turn it back into a stream.
+    /// </summary>
+    private readonly Dictionary<IClientSocket, byte[]> _observerLastSentStats = [];
+
     /// <summary>
     /// Record one (arrival time, body length) pair. Timestamps are non-decreasing (appends
     /// are sequential), so the list doubles as a sorted timeline. Trimmed to a 2x-max-delay
@@ -382,6 +462,20 @@ public sealed partial class GameSession
         {
             if (EnqueueObserverFrame(ws, BinaryEnvelope.Pack(MsgTick, BinaryEnvelope.PackU32(tickFrame))))
                 _observerLastSentTick[ws] = tickFrame;
+        }
+
+        // Telemetry, on the same delayed boundary. Checked independently of body and tick: the
+        // source sends it on change, so it moves on its own schedule and gating it behind either
+        // of the others would drop readings or hold them past the delay they are due at.
+        byte[] stats = force ? _lastStats : DelayedStats(effectiveNow);
+        if (stats.Length > 0)
+        {
+            byte[] lastSentStats = _observerLastSentStats.GetValueOrDefault(ws, []);
+            if (!stats.AsSpan().SequenceEqual(lastSentStats))
+            {
+                if (EnqueueObserverFrame(ws, BinaryEnvelope.Pack(MsgStats, stats)))
+                    _observerLastSentStats[ws] = stats;
+            }
         }
     }
 

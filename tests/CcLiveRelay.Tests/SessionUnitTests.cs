@@ -103,6 +103,21 @@ public class SessionUnitTests
            .Select(f => BinaryPrimitives.ReadUInt32LittleEndian(f.Payload.AsSpan(0, 4)))
            .ToList();
 
+    /// <summary>Telemetry payloads an observer received, decoded to (logicFps, pingMs).</summary>
+    private static List<(uint LogicFps, uint PingMs)> StatsPairs(FakeSocket ws) =>
+        ws.Frames.Where(f => f.Type == BinaryEnvelope.MsgStats)
+           .Select(f => (BinaryPrimitives.ReadUInt32LittleEndian(f.Payload.AsSpan(0, 4)),
+                         BinaryPrimitives.ReadUInt32LittleEndian(f.Payload.AsSpan(4, 4))))
+           .ToList();
+
+    private static byte[] Stats(uint logicFps, uint pingMs)
+    {
+        var payload = new byte[8];
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(0), logicFps);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(4), pingMs);
+        return payload;
+    }
+
     private static FakeSocket RegisterSource(GameSession session, long bodyLenSeen = 0)
     {
         var ws = new FakeSocket();
@@ -356,6 +371,118 @@ public class SessionUnitTests
 
         fx.Session.DelaySeconds = 0;
         Assert.Equal(620u, fx.Session.DelayedTickFrame(1052));
+    }
+
+    [Fact]
+    public async Task DelayedStats_ReturnsTelemetryAsOfNowMinusDelay()
+    {
+        var fx = new SessionFixture();
+        fx.Session.DelaySeconds = DelaySeconds;
+        for (int i = 0; i < 3; i++)
+        {
+            using var clock = new FakeClock(1010 + i * 10).Install();
+            await fx.Session.ApplyStatsAsync(fx.Source, Stats(60u - (uint)(i * 5), 64u + (uint)(i * 10)));
+        }
+        // Telemetry recorded at t=1010(60,64), t=1020(55,74), t=1030(50,84); delay=42.
+        Assert.Empty(fx.Session.DelayedStats(1051));   // before the first ages in
+        Assert.Equal(Stats(60, 64), fx.Session.DelayedStats(1052));
+        Assert.Equal(Stats(55, 74), fx.Session.DelayedStats(1065));
+        Assert.Equal(Stats(50, 84), fx.Session.DelayedStats(1099));
+
+        fx.Session.DelaySeconds = 0;
+        Assert.Equal(Stats(50, 84), fx.Session.DelayedStats(1052));
+    }
+
+    [Fact]
+    public async Task Stats_NotForwardedToHeldObserverBeforeDelayElapses()
+    {
+        // Same hazard as the raw tick: the source's logic rate and ping describe the match now,
+        // so a live telemetry frame would let a modified client poll the delay hold for liveness.
+        var fx = new SessionFixture();
+        await fx.SeedAsync();
+        fx.Session.DelaySeconds = DelaySeconds;
+        var ws = new FakeSocket();
+
+        Assert.True(fx.Session.AddObserver(ws, priority: false));
+
+        await fx.Session.ApplyStatsAsync(fx.Source, Stats(45, 92));
+        await ws.WaitQuietAsync();
+
+        Assert.Empty(StatsPairs(ws));
+    }
+
+    [Fact]
+    public async Task Stats_ForwardedToHeldObserverAfterDelayElapses()
+    {
+        var clock = new FakeClock(1000);
+        using (clock.Install())
+        {
+            var fx = new SessionFixture();
+            fx.Session.DelaySeconds = DelaySeconds;
+            await fx.Session.ApplyHeaderAsync(fx.Source, Fill(HeaderLen, (byte)'H'));
+
+            var ws = new FakeSocket();
+            Assert.True(fx.Session.AddObserver(ws, priority: false));
+            await ws.WaitQuietAsync();
+
+            clock.Now = 1010;
+            await fx.Session.ApplyStatsAsync(fx.Source, Stats(45, 92));
+            await ws.WaitQuietAsync();
+            Assert.Empty(StatsPairs(ws));   // not aged past the delay yet
+
+            clock.Now = 1010 + DelaySeconds + 1;
+            fx.Session.FlushHeldObservers();
+            await ws.WaitQuietAsync();
+
+            Assert.Equal([(45u, 92u)], StatsPairs(ws));
+        }
+    }
+
+    [Fact]
+    public async Task Stats_ForwardedToUnheldObserverImmediately()
+    {
+        // A priority viewer watches the live edge, so there is nothing to withhold from it.
+        var fx = new SessionFixture();
+        await fx.SeedAsync();
+        fx.Session.DelaySeconds = DelaySeconds;
+        var ws = new FakeSocket();
+
+        Assert.True(fx.Session.AddObserver(ws, priority: true));
+
+        await fx.Session.ApplyStatsAsync(fx.Source, Stats(45, 92));
+        await ws.WaitQuietAsync();
+
+        Assert.Equal([(45u, 92u)], StatsPairs(ws));
+    }
+
+    [Fact]
+    public async Task Stats_UnchangedValueNotResentToHeldObserver()
+    {
+        // The source sends on change; the delay hold must not turn that back into a stream. The
+        // flush runs on every append and on the 1 s ticker, so an unguarded copy would re-send
+        // the same reading dozens of times a second.
+        var clock = new FakeClock(1000);
+        using (clock.Install())
+        {
+            var fx = new SessionFixture();
+            fx.Session.DelaySeconds = DelaySeconds;
+            await fx.Session.ApplyHeaderAsync(fx.Source, Fill(HeaderLen, (byte)'H'));
+
+            var ws = new FakeSocket();
+            Assert.True(fx.Session.AddObserver(ws, priority: false));
+            await ws.WaitQuietAsync();
+
+            clock.Now = 1010;
+            await fx.Session.ApplyStatsAsync(fx.Source, Stats(45, 92));
+
+            clock.Now = 1010 + DelaySeconds + 1;
+            fx.Session.FlushHeldObservers();
+            fx.Session.FlushHeldObservers();
+            fx.Session.FlushHeldObservers();
+            await ws.WaitQuietAsync();
+
+            Assert.Equal([(45u, 92u)], StatsPairs(ws));
+        }
     }
 
     [Fact]

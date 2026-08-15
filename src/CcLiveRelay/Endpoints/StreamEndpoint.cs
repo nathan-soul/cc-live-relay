@@ -213,6 +213,9 @@ public static class StreamEndpoint
                     case BinaryEnvelope.MsgTick:
                         await session.ApplyTickAsync(client, payload);
                         break;
+                    case BinaryEnvelope.MsgStats:
+                        await session.ApplyStatsAsync(client, payload);
+                        break;
                     case BinaryEnvelope.MsgChat:
                         await session.ApplyChatAsync(client, payload);
                         break;

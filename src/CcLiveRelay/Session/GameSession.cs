@@ -59,6 +59,11 @@ public sealed partial class GameSession
     /// <summary>Newest frame heartbeat seen from any source. Monotonic.</summary>
     private uint _lastTickFrame;
 
+    /// <summary>Latest telemetry payload from the source, [logicFps u32][pingMs u32], or empty
+    /// before the first one. Not monotonic in any sense - the values move both ways - so unlike
+    /// the tick this is simply the last value seen.</summary>
+    private byte[] _lastStats = [];
+
     public GameSession(string lobbyId, RelayOptions options, RelayStore store)
     {
         LobbyId = lobbyId;
@@ -338,6 +343,35 @@ public sealed partial class GameSession
         // Held observers never see this live tick (see BroadcastEnvelope) - they get a delayed
         // one, bound by the same watermark as body bytes, from the flush path below.
         FlushHeldObservers();
+    }
+
+    /// <summary>
+    /// The source's logic frame rate and ping, [logicFps u32 LE][pingMs u32 LE]. Display-only
+    /// telemetry: nothing here is simulated from, so unlike the tick there is no ordering
+    /// requirement against the body, and no monotonic rule - the values legitimately go both up
+    /// and down. Stored as the latest known pair, forwarded live to unheld observers and released
+    /// to held ones on the delayed boundary.
+    /// </summary>
+    public async Task ApplyStatsAsync(IClientSocket ws, byte[] payload)
+    {
+        if (_sourceDemoted(ws))
+            return;
+        if (payload.Length < 8)
+        {
+            Console.WriteLine($"[LIVESTREAMER] [WARN] STATS payload too short: {payload.Length} bytes");
+            return;
+        }
+
+        List<IClientSocket> targets;
+        lock (_sync)
+        {
+            _lastStats = payload[..8];
+            _recordStatsHistory(TimeSource.Now(), _lastStats);
+            targets = [.. _observerWsSet];
+        }
+        BroadcastEnvelope(MsgStats, payload, targets);
+        FlushHeldObservers();
+        await Task.CompletedTask;
     }
 
     public void TouchSource(IClientSocket ws)

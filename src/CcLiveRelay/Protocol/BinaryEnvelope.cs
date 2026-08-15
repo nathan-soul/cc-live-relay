@@ -29,6 +29,18 @@ public static class BinaryEnvelope
     // "every record with frame <= N arrived".
     public const byte MsgTick = 9;
 
+    // Match telemetry: the source's own logic frame rate and ping, [logicFps u32 LE][pingMs u32
+    // LE]. Display only - the observer shows them on its FPS counter so a viewer sees the same
+    // numbers a player in the match sees. Sent on change rather than per frame, so the latest
+    // value stands until the next one arrives; the source's own heartbeat bounds how stale that
+    // can get. Opaque to the relay, which forwards it and remembers the latest value for
+    // observers joining later.
+    //
+    // Withheld from held observers exactly like MsgTick: it says something about the match *now*,
+    // which is what the byte-level delay hold exists to withhold, and it would otherwise serve a
+    // modified client as a liveness oracle. Released on the same now-delay boundary as body bytes.
+    public const byte MsgStats = 10;
+
     public static byte[] Pack(byte msgType, ReadOnlySpan<byte> payload)
     {
         var frame = new byte[5 + payload.Length];
