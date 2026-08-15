@@ -32,7 +32,7 @@ public sealed partial class GameSession
             if (_observerWsSet.Count >= _options.MaxObserversPerGame)
                 return false;
 
-            _observerWriters[ws] = new ObserverWriter(ws, _options.ObserverQueueFrames, MarkObserverDead);
+            _observerWriters[ws] = new ObserverWriter(ws, _options.ObserverQueueFrames, MarkObserverDead, _options.Debug);
 
             // Held observers start at the delayed edge: their catch-up covers only bytes
             // older than the delay, and the pointer doubles as "delivered so far".
@@ -70,6 +70,7 @@ public sealed partial class GameSession
             writer.Stop();
         _observerCatchupLimit.Remove(ws);
         _observerHeld.Remove(ws);
+        _observerLastFlushAt.Remove(ws);
         _spectatorRate.Remove(ws);
         // Wake the watch loop (blocked in ReceiveAsync) so the endpoint winds down.
         _ = Task.Run(async () =>
@@ -224,6 +225,10 @@ public sealed partial class GameSession
     /// <summary>Recorded (arrival time, body length) pairs for the watermark lookup.</summary>
     private readonly List<BodyHistoryEntry> _bodyHistory = [];
 
+    /// <summary>Debug only: wall-clock of each held observer's last delivered flush, to log the
+    /// gap between deliveries while chasing the 2026-08-15 "cuts out every second" report.</summary>
+    private readonly Dictionary<IClientSocket, double> _observerLastFlushAt = [];
+
     /// <summary>
     /// Record one (arrival time, body length) pair. Timestamps are non-decreasing (appends
     /// are sequential), so the list doubles as a sorted timeline. Trimmed to a 2x-max-delay
@@ -282,6 +287,16 @@ public sealed partial class GameSession
                 return;   // queue full -> observer dropped; nothing further to deliver
         }
         _observerCatchupLimit[ws] = limit;
+
+        if (_options.Debug)
+        {
+            double gapMs = _observerLastFlushAt.TryGetValue(ws, out var lastAt)
+                ? (effectiveNow - lastAt) * 1000.0
+                : -1;
+            _observerLastFlushAt[ws] = effectiveNow;
+            Console.WriteLine($"[OBSERVER] [FLUSH] {DateTime.Now:HH:mm:ss.fff} game={LobbyId} " +
+                $"ws={ws.GetHashCode()} delta={limit - pointer}B gapMs={gapMs:F0} pointer={pointer} watermark={limit}");
+        }
     }
 
     /// <summary>
