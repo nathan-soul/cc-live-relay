@@ -331,9 +331,13 @@ public sealed partial class GameSession
             if (frame <= _lastTickFrame)
                 return;
             _lastTickFrame = frame;
+            _recordTickHistory(TimeSource.Now(), frame);
             targets = [.. _observerWsSet];
         }
         BroadcastEnvelope(MsgTick, payload, targets);
+        // Held observers never see this live tick (see BroadcastEnvelope) - they get a delayed
+        // one, bound by the same watermark as body bytes, from the flush path below.
+        FlushHeldObservers();
     }
 
     public void TouchSource(IClientSocket ws)

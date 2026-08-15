@@ -318,8 +318,12 @@ public class SessionUnitTests
     }
 
     [Fact]
-    public async Task Tick_NotForwardedToHeldObserver()
+    public async Task Tick_NotForwardedToHeldObserverBeforeDelayElapses()
     {
+        // The raw live tick must never reach a held observer (it states the true, undelayed
+        // frame) - only the delayed value from DelayedTickFrame, which stays 0 until a tick has
+        // aged past the delay. This test covers "immediately after the tick, before any time
+        // has passed"; Tick_ForwardedToHeldObserverAfterDelayElapses covers the other side.
         var fx = new SessionFixture();
         await fx.SeedAsync();
         fx.Session.DelaySeconds = DelaySeconds;
@@ -332,6 +336,60 @@ public class SessionUnitTests
 
         Assert.Empty(TickFrames(ws));
         Assert.Equal(600u, fx.Session.LastTickFrame);
+    }
+
+    [Fact]
+    public async Task DelayedTickFrame_ReturnsTickAsOfNowMinusDelay()
+    {
+        var fx = new SessionFixture();
+        fx.Session.DelaySeconds = DelaySeconds;
+        for (int i = 0; i < 3; i++)
+        {
+            using var clock = new FakeClock(1010 + i * 10).Install();
+            await fx.Session.ApplyTickAsync(fx.Source, U32(600u + (uint)(i * 10)));
+        }
+        // Ticks recorded at t=1010(600), t=1020(610), t=1030(620); delay=42.
+        Assert.Equal(0u, fx.Session.DelayedTickFrame(1051));   // before the first ages in
+        Assert.Equal(600u, fx.Session.DelayedTickFrame(1052));
+        Assert.Equal(610u, fx.Session.DelayedTickFrame(1065));
+        Assert.Equal(620u, fx.Session.DelayedTickFrame(1099));
+
+        fx.Session.DelaySeconds = 0;
+        Assert.Equal(620u, fx.Session.DelayedTickFrame(1052));
+    }
+
+    [Fact]
+    public async Task Tick_ForwardedToHeldObserverAfterDelayElapses()
+    {
+        // The bug this guards against (2026-08-15): held observers were withheld from the
+        // heartbeat entirely, so their only "what frame is the game at" signal was the raw
+        // record edge, which sawtooths whenever a stretch of play produces no records - the
+        // client-side buffering gate would then freeze for that whole stretch. The fix is a
+        // delayed tick, bound by the exact same watermark boundary as body bytes, so it can
+        // never reveal anything the observer couldn't already derive from bytes it's legitimately
+        // receiving.
+        var clock = new FakeClock(1000);
+        using (clock.Install())
+        {
+            var fx = new SessionFixture();
+            fx.Session.DelaySeconds = DelaySeconds;
+            await fx.Session.ApplyHeaderAsync(fx.Source, Fill(HeaderLen, (byte)'H'));
+
+            var ws = new FakeSocket();
+            Assert.True(fx.Session.AddObserver(ws, priority: false));
+            await ws.WaitQuietAsync();
+
+            clock.Now = 1010;
+            await fx.Session.ApplyTickAsync(fx.Source, U32(600));
+            await ws.WaitQuietAsync();
+            Assert.Empty(TickFrames(ws));   // not aged past the delay yet
+
+            clock.Now = 1010 + DelaySeconds + 1;
+            fx.Session.FlushHeldObservers();
+            await ws.WaitQuietAsync();
+
+            Assert.Equal([600u], TickFrames(ws));   // the delayed value, not any later live tick
+        }
     }
 
     [Fact]

@@ -71,6 +71,7 @@ public sealed partial class GameSession
         _observerCatchupLimit.Remove(ws);
         _observerHeld.Remove(ws);
         _observerLastFlushAt.Remove(ws);
+        _observerLastSentTick.Remove(ws);
         _spectatorRate.Remove(ws);
         // Wake the watch loop (blocked in ReceiveAsync) so the endpoint winds down.
         _ = Task.Run(async () =>
@@ -100,12 +101,18 @@ public sealed partial class GameSession
         int delaySnapshot;
         long limit;
         byte[] bodySnapshot;
+        double catchupNow = TimeSource.Now();
         lock (_sync)
         {
             headerSnapshot = _header.ToArray();
             endedSnapshot = _ended;
             held = _observerHeld.GetValueOrDefault(ws, false);
-            tickSnapshot = _lastTickFrame;
+            // A held observer must never see the raw live tick (that is the true, undelayed
+            // frame - exactly what the byte hold exists to withhold); it gets whatever tick was
+            // current as of now-delay instead, same boundary as its body catch-up slice below.
+            tickSnapshot = held ? DelayedTickFrame(catchupNow) : _lastTickFrame;
+            if (held)
+                _observerLastSentTick[ws] = tickSnapshot;
             // Held observers get delay_seconds: 0 — the relay's byte-level hold IS the delay,
             // and the client must not double-hold on top of it.
             delaySnapshot = held ? 0 : _delaySeconds;
@@ -148,10 +155,10 @@ public sealed partial class GameSession
         }
 
         // Frame heartbeat for the joining observer, after the body it belongs to. Ticks are
-        // broadcast, not stored, so without this a joiner would sit on the record-derived
-        // edge until the next one arrives. Held observers are excluded for the same reason
-        // they are excluded from live ticks.
-        if (tickSnapshot != 0 && !held)
+        // broadcast, not stored, so without this a joiner would sit on the record-derived edge
+        // until the next one arrives - held observers included, now that tickSnapshot above is
+        // already the delayed value for them rather than the raw live one.
+        if (tickSnapshot != 0)
         {
             if (!EnqueueObserverFrame(ws, BinaryEnvelope.Pack(MsgTick, BinaryEnvelope.PackU32(tickSnapshot))))
                 return;
@@ -229,6 +236,70 @@ public sealed partial class GameSession
     /// gap between deliveries while chasing the 2026-08-15 "cuts out every second" report.</summary>
     private readonly Dictionary<IClientSocket, double> _observerLastFlushAt = [];
 
+    /// <summary>Highest delayed-tick frame already sent to each held observer, so the flush
+    /// only enqueues a MSG_TICK when the delayed value actually advances.</summary>
+    private readonly Dictionary<IClientSocket, uint> _observerLastSentTick = [];
+
+    private readonly struct TickHistoryEntry(double timestamp, uint frame)
+    {
+        public readonly double Timestamp = timestamp;
+        public readonly uint Frame = frame;
+    }
+
+    /// <summary>
+    /// Arrival-time history of the streamer's frame heartbeat (MSG_TICK), mirroring
+    /// _bodyHistory. A held observer never sees the raw heartbeat (that would tell it the true,
+    /// undelayed live frame - the exact thing the byte-level hold exists to withhold); instead
+    /// DelayedTickFrame looks up whatever tick was current as of now-delay, the same boundary
+    /// DelayedWatermark applies to bytes. Without this, a held observer's only source of "what
+    /// frame is the game at" is the record edge itself, which - per getLiveEdge()'s own comment
+    /// client-side - sawtooths in ~1.7s jumps on any stream that is not command-dense every
+    /// frame: this is the fix for the 2026-08-15 "cuts out every second, falls further behind"
+    /// report, which turned out to be a client-side gate freezing during exactly those gaps.
+    /// </summary>
+    private readonly List<TickHistoryEntry> _tickHistory = [];
+
+    private void _recordTickHistory(double ts, uint frame)
+    {
+        _tickHistory.Add(new TickHistoryEntry(ts, frame));
+        double cutoff = ts - 2 * _options.MaxDelaySeconds;
+        int trim = 0;
+        while (trim < _tickHistory.Count - 1 && _tickHistory[trim].Timestamp < cutoff)
+            trim++;
+        if (trim > 0)
+            _tickHistory.RemoveRange(0, trim);
+        while (_tickHistory.Count > _options.BodyHistoryMax)
+            _tickHistory.RemoveAt(0);
+    }
+
+    /// <summary>The heartbeat frame as of `now - delay`: the same lookup as DelayedWatermark,
+    /// against tick arrivals instead of body length. 0 means no tick has qualified yet (the
+    /// caller must treat that as "say nothing", matching the live-tick convention).</summary>
+    public uint DelayedTickFrame(double now)
+    {
+        lock (_sync)
+        {
+            if (_delaySeconds <= 0)
+                return _lastTickFrame;
+            double cutoff = now - _delaySeconds;
+            var hist = _tickHistory;
+            if (hist.Count == 0 || hist[0].Timestamp > cutoff)
+                return 0;
+            if (hist[^1].Timestamp <= cutoff)
+                return hist[^1].Frame;
+            int lo = 0, hi = hist.Count - 1;
+            while (lo < hi)
+            {
+                int mid = (lo + hi + 1) / 2;
+                if (hist[mid].Timestamp <= cutoff)
+                    lo = mid;
+                else
+                    hi = mid - 1;
+            }
+            return hist[lo].Frame;
+        }
+    }
+
     /// <summary>
     /// Record one (arrival time, body length) pair. Timestamps are non-decreasing (appends
     /// are sequential), so the list doubles as a sorted timeline. Trimmed to a 2x-max-delay
@@ -268,8 +339,12 @@ public sealed partial class GameSession
 
     /// <summary>
     /// Advance one held observer's delivered edge to the current watermark and enqueue the
-    /// chunks. force=True ignores the watermark and delivers everything left (stream end:
-    /// nothing is left to spoil). Caller must hold <c>_sync</c>; nothing here touches the
+    /// chunks, then do the same for its delayed tick heartbeat. force=True ignores both
+    /// watermarks and delivers everything left (stream end: nothing is left to spoil). The tick
+    /// check runs independently of whether body advanced - a heartbeat arrives on a fixed
+    /// cadence regardless of command activity, which is the entire reason it exists (see
+    /// DelayedTickFrame): gating it behind "body also moved" would silently reintroduce the
+    /// sawtooth this is meant to fix. Caller must hold <c>_sync</c>; nothing here touches the
     /// socket.
     /// </summary>
     private void EnqueueHeldFlushLocked(IClientSocket ws, double? now = null, bool force = false)
@@ -277,25 +352,36 @@ public sealed partial class GameSession
         if (!_observerHeld.GetValueOrDefault(ws, false))
             return;
         double effectiveNow = now ?? TimeSource.Now();
+
         long limit = force ? _body.Count : DelayedWatermark(effectiveNow);
         long pointer = _observerCatchupLimit.GetValueOrDefault(ws, 0);
-        if (limit <= pointer)
-            return;
-        foreach (var frame in PackBodyFrames(pointer, limit))
+        bool bodyAdvanced = limit > pointer;
+        if (bodyAdvanced)
         {
-            if (!EnqueueObserverFrame(ws, frame))
-                return;   // queue full -> observer dropped; nothing further to deliver
-        }
-        _observerCatchupLimit[ws] = limit;
+            foreach (var frame in PackBodyFrames(pointer, limit))
+            {
+                if (!EnqueueObserverFrame(ws, frame))
+                    return;   // queue full -> observer dropped; nothing further to deliver
+            }
+            _observerCatchupLimit[ws] = limit;
 
-        if (_options.Debug)
+            if (_options.Debug)
+            {
+                double gapMs = _observerLastFlushAt.TryGetValue(ws, out var lastAt)
+                    ? (effectiveNow - lastAt) * 1000.0
+                    : -1;
+                _observerLastFlushAt[ws] = effectiveNow;
+                Console.WriteLine($"[OBSERVER] [FLUSH] {DateTime.Now:HH:mm:ss.fff} game={LobbyId} " +
+                    $"ws={ws.GetHashCode()} delta={limit - pointer}B gapMs={gapMs:F0} pointer={pointer} watermark={limit}");
+            }
+        }
+
+        uint tickFrame = force ? _lastTickFrame : DelayedTickFrame(effectiveNow);
+        uint lastSentTick = _observerLastSentTick.GetValueOrDefault(ws, 0u);
+        if (tickFrame > lastSentTick)
         {
-            double gapMs = _observerLastFlushAt.TryGetValue(ws, out var lastAt)
-                ? (effectiveNow - lastAt) * 1000.0
-                : -1;
-            _observerLastFlushAt[ws] = effectiveNow;
-            Console.WriteLine($"[OBSERVER] [FLUSH] {DateTime.Now:HH:mm:ss.fff} game={LobbyId} " +
-                $"ws={ws.GetHashCode()} delta={limit - pointer}B gapMs={gapMs:F0} pointer={pointer} watermark={limit}");
+            if (EnqueueObserverFrame(ws, BinaryEnvelope.Pack(MsgTick, BinaryEnvelope.PackU32(tickFrame))))
+                _observerLastSentTick[ws] = tickFrame;
         }
     }
 
